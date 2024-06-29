@@ -21,6 +21,9 @@ class TestMySQL(Validator):
         self.validate_identity("CREATE TABLE foo (a BIGINT, FULLTEXT INDEX (b))")
         self.validate_identity("CREATE TABLE foo (a BIGINT, SPATIAL INDEX (b))")
         self.validate_identity("ALTER TABLE t1 ADD COLUMN x INT, ALGORITHM=INPLACE, LOCK=EXCLUSIVE")
+        self.validate_identity("ALTER TABLE t ADD INDEX `i` (`c`)")
+        self.validate_identity("ALTER TABLE t ADD UNIQUE `i` (`c`)")
+        self.validate_identity("ALTER TABLE test_table MODIFY COLUMN test_column LONGTEXT")
         self.validate_identity(
             "CREATE TABLE `oauth_consumer` (`key` VARCHAR(32) NOT NULL, UNIQUE `OAUTH_CONSUMER_KEY` (`key`))"
         )
@@ -61,6 +64,10 @@ class TestMySQL(Validator):
             "CREATE OR REPLACE VIEW my_view AS SELECT column1 AS `boo`, column2 AS `foo` FROM my_table WHERE column3 = 'some_value' UNION SELECT q.* FROM fruits_table, JSON_TABLE(Fruits, '$[*]' COLUMNS(id VARCHAR(255) PATH '$.$id', value VARCHAR(255) PATH '$.value')) AS q",
         )
         self.validate_identity(
+            "ALTER TABLE t ADD KEY `i` (`c`)",
+            "ALTER TABLE t ADD INDEX `i` (`c`)",
+        )
+        self.validate_identity(
             "CREATE TABLE `foo` (`id` char(36) NOT NULL DEFAULT (uuid()), PRIMARY KEY (`id`), UNIQUE KEY `id` (`id`))",
             "CREATE TABLE `foo` (`id` CHAR(36) NOT NULL DEFAULT (UUID()), PRIMARY KEY (`id`), UNIQUE `id` (`id`))",
         )
@@ -74,9 +81,6 @@ class TestMySQL(Validator):
         )
         self.validate_identity(
             "ALTER TABLE test_table ALTER COLUMN test_column SET DATA TYPE LONGTEXT",
-            "ALTER TABLE test_table MODIFY COLUMN test_column LONGTEXT",
-        )
-        self.validate_identity(
             "ALTER TABLE test_table MODIFY COLUMN test_column LONGTEXT",
         )
         self.validate_identity(
@@ -113,6 +117,8 @@ class TestMySQL(Validator):
         )
 
     def test_identity(self):
+        self.validate_identity("SELECT CAST(COALESCE(`id`, 'NULL') AS CHAR CHARACTER SET binary)")
+        self.validate_identity("SELECT e.* FROM e STRAIGHT_JOIN p ON e.x = p.y")
         self.validate_identity("ALTER TABLE test_table ALTER COLUMN test_column SET DEFAULT 1")
         self.validate_identity("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:00.0000')")
         self.validate_identity("SELECT @var1 := 1, @var2")
@@ -149,8 +155,15 @@ class TestMySQL(Validator):
             "SELECT * FROM t1, t2, t3 FOR SHARE OF t1 NOWAIT FOR UPDATE OF t2, t3 SKIP LOCKED"
         )
         self.validate_identity(
+            "REPLACE INTO table SELECT id FROM table2 WHERE cnt > 100", check_command_warning=True
+        )
+        self.validate_identity(
             """SELECT * FROM foo WHERE 3 MEMBER OF(info->'$.value')""",
             """SELECT * FROM foo WHERE 3 MEMBER OF(JSON_EXTRACT(info, '$.value'))""",
+        )
+        self.validate_identity(
+            "SELECT 1 AS row",
+            "SELECT 1 AS `row`",
         )
 
         # Index hints
@@ -215,6 +228,9 @@ class TestMySQL(Validator):
         self.validate_identity("CHAR(77, 121, 83, 81, '76')")
         self.validate_identity("CHAR(77, 77.3, '77.3' USING utf8mb4)")
         self.validate_identity("SELECT * FROM t1 PARTITION(p0)")
+        self.validate_identity("SELECT @var1 := 1, @var2")
+        self.validate_identity("SELECT @var1, @var2 := @var1")
+        self.validate_identity("SELECT @var1 := COUNT(*) FROM t1")
 
     def test_types(self):
         for char_type in MySQL.Generator.CHAR_CAST_MAPPING:
@@ -331,7 +347,7 @@ class TestMySQL(Validator):
         write_CC = {
             "bigquery": "SELECT 0xCC",
             "clickhouse": "SELECT 0xCC",
-            "databricks": "SELECT 204",
+            "databricks": "SELECT X'CC'",
             "drill": "SELECT 204",
             "duckdb": "SELECT 204",
             "hive": "SELECT 204",
@@ -352,7 +368,7 @@ class TestMySQL(Validator):
         write_CC_with_leading_zeros = {
             "bigquery": "SELECT 0x0000CC",
             "clickhouse": "SELECT 0x0000CC",
-            "databricks": "SELECT 204",
+            "databricks": "SELECT X'0000CC'",
             "drill": "SELECT 204",
             "duckdb": "SELECT 204",
             "hive": "SELECT 204",
@@ -607,6 +623,16 @@ class TestMySQL(Validator):
         )
 
     def test_mysql(self):
+        self.validate_all(
+            "SELECT CONCAT('11', '22')",
+            read={
+                "postgres": "SELECT '11' || '22'",
+            },
+            write={
+                "mysql": "SELECT CONCAT('11', '22')",
+                "postgres": "SELECT CONCAT('11', '22')",
+            },
+        )
         self.validate_all(
             "SELECT department, GROUP_CONCAT(name) AS employee_names FROM data GROUP BY department",
             read={

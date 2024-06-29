@@ -9,6 +9,52 @@ if t.TYPE_CHECKING:
     from sqlglot.generator import Generator
 
 
+def preprocess(
+    transforms: t.List[t.Callable[[exp.Expression], exp.Expression]],
+) -> t.Callable[[Generator, exp.Expression], str]:
+    """
+    Creates a new transform by chaining a sequence of transformations and converts the resulting
+    expression to SQL, using either the "_sql" method corresponding to the resulting expression,
+    or the appropriate `Generator.TRANSFORMS` function (when applicable -- see below).
+
+    Args:
+        transforms: sequence of transform functions. These will be called in order.
+
+    Returns:
+        Function that can be used as a generator transform.
+    """
+
+    def _to_sql(self, expression: exp.Expression) -> str:
+        expression_type = type(expression)
+
+        expression = transforms[0](expression)
+        for transform in transforms[1:]:
+            expression = transform(expression)
+
+        _sql_handler = getattr(self, expression.key + "_sql", None)
+        if _sql_handler:
+            return _sql_handler(expression)
+
+        transforms_handler = self.TRANSFORMS.get(type(expression))
+        if transforms_handler:
+            if expression_type is type(expression):
+                if isinstance(expression, exp.Func):
+                    return self.function_fallback_sql(expression)
+
+                # Ensures we don't enter an infinite loop. This can happen when the original expression
+                # has the same type as the final expression and there's no _sql method available for it,
+                # because then it'd re-enter _to_sql.
+                raise ValueError(
+                    f"Expression type {expression.__class__.__name__} requires a _sql method in order to be transformed."
+                )
+
+            return transforms_handler(self, expression)
+
+        raise ValueError(f"Unsupported expression type {expression.__class__.__name__}.")
+
+    return _to_sql
+
+
 def unalias_group(expression: exp.Expression) -> exp.Expression:
     """
     Replace references to select aliases in GROUP BY clauses.
@@ -105,7 +151,14 @@ def eliminate_qualify(expression: exp.Expression) -> exp.Expression:
                 select.replace(exp.alias_(select, alias))
                 taken.add(alias)
 
-        outer_selects = exp.select(*[select.alias_or_name for select in expression.selects])
+        def _select_alias_or_name(select: exp.Expression) -> str | exp.Column:
+            alias_or_name = select.alias_or_name
+            identifier = select.args.get("alias") or select.this
+            if isinstance(identifier, exp.Identifier):
+                return exp.column(alias_or_name, quoted=identifier.args.get("quoted"))
+            return alias_or_name
+
+        outer_selects = exp.select(*list(map(_select_alias_or_name, expression.selects)))
         qualify_filters = expression.args["qualify"].pop().this
         expression_by_alias = {
             select.alias: select.this
@@ -386,7 +439,7 @@ def add_recursive_cte_column_names(expression: exp.Expression) -> exp.Expression
         for cte in expression.expressions:
             if not cte.args["alias"].columns:
                 query = cte.this
-                if isinstance(query, exp.Union):
+                if isinstance(query, exp.SetOperation):
                     query = query.this
 
                 cte.args["alias"].set(
@@ -465,19 +518,28 @@ def move_ctes_to_top_level(expression: exp.Expression) -> exp.Expression:
     TODO: handle name clashes whilst moving CTEs (it can get quite tricky & costly).
     """
     top_level_with = expression.args.get("with")
-    for node in expression.find_all(exp.With):
-        if node.parent is expression:
+    for inner_with in expression.find_all(exp.With):
+        if inner_with.parent is expression:
             continue
 
-        inner_with = node.pop()
         if not top_level_with:
-            top_level_with = inner_with
+            top_level_with = inner_with.pop()
             expression.set("with", top_level_with)
         else:
             if inner_with.recursive:
                 top_level_with.set("recursive", True)
 
-            top_level_with.set("expressions", inner_with.expressions + top_level_with.expressions)
+            parent_cte = inner_with.find_ancestor(exp.CTE)
+            inner_with.pop()
+
+            if parent_cte:
+                i = top_level_with.expressions.index(parent_cte)
+                top_level_with.expressions[i:i] = inner_with.expressions
+                top_level_with.set("expressions", top_level_with.expressions)
+            else:
+                top_level_with.set(
+                    "expressions", top_level_with.expressions + inner_with.expressions
+                )
 
     return expression
 
@@ -489,7 +551,10 @@ def ensure_bools(expression: exp.Expression) -> exp.Expression:
     def _ensure_bool(node: exp.Expression) -> None:
         if (
             node.is_number
-            or node.is_type(exp.DataType.Type.UNKNOWN, *exp.DataType.NUMERIC_TYPES)
+            or (
+                not isinstance(node, exp.SubqueryPredicate)
+                and node.is_type(exp.DataType.Type.UNKNOWN, *exp.DataType.NUMERIC_TYPES)
+            )
             or (isinstance(node, exp.Column) and not node.type)
         ):
             node.replace(node.neq(0))
@@ -604,47 +669,103 @@ def struct_kv_to_alias(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
-def preprocess(
-    transforms: t.List[t.Callable[[exp.Expression], exp.Expression]],
-) -> t.Callable[[Generator, exp.Expression], str]:
+def eliminate_join_marks(expression: exp.Expression) -> exp.Expression:
     """
-    Creates a new transform by chaining a sequence of transformations and converts the resulting
-    expression to SQL, using either the "_sql" method corresponding to the resulting expression,
-    or the appropriate `Generator.TRANSFORMS` function (when applicable -- see below).
+    Remove join marks from an AST. This rule assumes that all marked columns are qualified.
+    If this does not hold for a query, consider running `sqlglot.optimizer.qualify` first.
+
+    For example,
+        SELECT * FROM a, b WHERE a.id = b.id(+)    -- ... is converted to
+        SELECT * FROM a LEFT JOIN b ON a.id = b.id -- this
 
     Args:
-        transforms: sequence of transform functions. These will be called in order.
+        expression: The AST to remove join marks from.
 
     Returns:
-        Function that can be used as a generator transform.
+       The AST with join marks removed.
     """
+    from sqlglot.optimizer.scope import traverse_scope
 
-    def _to_sql(self, expression: exp.Expression) -> str:
-        expression_type = type(expression)
+    for scope in traverse_scope(expression):
+        query = scope.expression
 
-        expression = transforms[0](expression)
-        for transform in transforms[1:]:
-            expression = transform(expression)
+        where = query.args.get("where")
+        joins = query.args.get("joins")
 
-        _sql_handler = getattr(self, expression.key + "_sql", None)
-        if _sql_handler:
-            return _sql_handler(expression)
+        if not where or not joins:
+            continue
 
-        transforms_handler = self.TRANSFORMS.get(type(expression))
-        if transforms_handler:
-            if expression_type is type(expression):
-                if isinstance(expression, exp.Func):
-                    return self.function_fallback_sql(expression)
+        query_from = query.args["from"]
 
-                # Ensures we don't enter an infinite loop. This can happen when the original expression
-                # has the same type as the final expression and there's no _sql method available for it,
-                # because then it'd re-enter _to_sql.
-                raise ValueError(
-                    f"Expression type {expression.__class__.__name__} requires a _sql method in order to be transformed."
-                )
+        # These keep track of the joins to be replaced
+        new_joins: t.Dict[str, exp.Join] = {}
+        old_joins = {join.alias_or_name: join for join in joins}
 
-            return transforms_handler(self, expression)
+        for column in scope.columns:
+            if not column.args.get("join_mark"):
+                continue
 
-        raise ValueError(f"Unsupported expression type {expression.__class__.__name__}.")
+            predicate = column.find_ancestor(exp.Predicate, exp.Select)
+            assert isinstance(
+                predicate, exp.Binary
+            ), "Columns can only be marked with (+) when involved in a binary operation"
 
-    return _to_sql
+            predicate_parent = predicate.parent
+            join_predicate = predicate.pop()
+
+            left_columns = [
+                c for c in join_predicate.left.find_all(exp.Column) if c.args.get("join_mark")
+            ]
+            right_columns = [
+                c for c in join_predicate.right.find_all(exp.Column) if c.args.get("join_mark")
+            ]
+
+            assert not (
+                left_columns and right_columns
+            ), "The (+) marker cannot appear in both sides of a binary predicate"
+
+            marked_column_tables = set()
+            for col in left_columns or right_columns:
+                table = col.table
+                assert table, f"Column {col} needs to be qualified with a table"
+
+                col.set("join_mark", False)
+                marked_column_tables.add(table)
+
+            assert (
+                len(marked_column_tables) == 1
+            ), "Columns of only a single table can be marked with (+) in a given binary predicate"
+
+            join_this = old_joins.get(col.table, query_from).this
+            new_join = exp.Join(this=join_this, on=join_predicate, kind="LEFT")
+
+            # Upsert new_join into new_joins dictionary
+            new_join_alias_or_name = new_join.alias_or_name
+            existing_join = new_joins.get(new_join_alias_or_name)
+            if existing_join:
+                existing_join.set("on", exp.and_(existing_join.args.get("on"), new_join.args["on"]))
+            else:
+                new_joins[new_join_alias_or_name] = new_join
+
+            # If the parent of the target predicate is a binary node, then it now has only one child
+            if isinstance(predicate_parent, exp.Binary):
+                if predicate_parent.left is None:
+                    predicate_parent.replace(predicate_parent.right)
+                else:
+                    predicate_parent.replace(predicate_parent.left)
+
+        if query_from.alias_or_name in new_joins:
+            only_old_joins = old_joins.keys() - new_joins.keys()
+            assert (
+                len(only_old_joins) >= 1
+            ), "Cannot determine which table to use in the new FROM clause"
+
+            new_from_name = list(only_old_joins)[0]
+            query.set("from", exp.From(this=old_joins[new_from_name].this))
+
+        query.set("joins", list(new_joins.values()))
+
+        if not where.this:
+            where.pop()
+
+    return expression

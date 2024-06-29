@@ -361,10 +361,24 @@ impl<'a> TokenizerState<'a> {
             // Skip the comment's start delimiter.
             self.advance(comment_start_size as isize)?;
 
+            let mut comment_count = 1;
             let comment_end_size = comment_end.len();
 
-            while !self.is_end && self.chars(comment_end_size) != *comment_end {
+            while !self.is_end {
+                if self.chars(comment_end_size) == *comment_end {
+                    comment_count -= 1;
+                    if comment_count == 0 {
+                        break;
+                    }
+                }
+
                 self.advance(1)?;
+
+                // Nested comments are allowed by some dialects, e.g. databricks, duckdb, postgres
+                if !self.is_end && self.chars(comment_start_size) == *comment_start {
+                    self.advance(comment_start_size as isize)?;
+                    comment_count += 1
+                }
             }
 
             let text = self.text();
@@ -405,28 +419,22 @@ impl<'a> TokenizerState<'a> {
             } else if *token_type == self.token_types.bit_string {
                 (Some(2), *token_type, end.clone())
             } else if *token_type == self.token_types.heredoc_string {
-                if self.settings.heredoc_tag_is_identifier
-                    && !self.is_identifier(self.peek_char)
-                    && self.peek_char.to_string() != *end
-                {
-                    if self.token_types.heredoc_string_alternative != self.token_types.var {
-                        self.add(self.token_types.heredoc_string_alternative, None)?
-                    } else {
-                        self.scan_var()?
-                    };
-
-                    return Ok(true)
-                };
-
                 self.advance(1)?;
 
                 let tag = if self.current_char.to_string() == *end {
                     String::from("")
                 } else {
-                    self.extract_string(end, false, false, !self.settings.heredoc_tag_is_identifier)?
+                    self.extract_string(end, false, true, !self.settings.heredoc_tag_is_identifier)?
                 };
 
-                if self.is_end && !tag.is_empty() && self.settings.heredoc_tag_is_identifier {
+                if !tag.is_empty()
+                    && self.settings.heredoc_tag_is_identifier
+                    && (self.is_end || !self.is_identifier(&tag))
+                {
+                    if !self.is_end {
+                        self.advance(-1)?;
+                    }
+
                     self.advance(-(tag.len() as isize))?;
                     self.add(self.token_types.heredoc_string_alternative, None)?;
                     return Ok(true)
@@ -441,7 +449,7 @@ impl<'a> TokenizerState<'a> {
         };
 
         self.advance(start.len() as isize)?;
-        let text = self.extract_string(&end, false, token_type != self.token_types.raw_string, true)?;
+        let text = self.extract_string(&end, false, token_type == self.token_types.raw_string, true)?;
 
         if let Some(b) = base {
             if u64::from_str_radix(&text, b).is_err() {
@@ -483,6 +491,9 @@ impl<'a> TokenizerState<'a> {
             if self.peek_char.is_digit(10) {
                 self.advance(1)?;
             } else if self.peek_char == '.' && !decimal {
+                if self.tokens.last().map(|t| t.token_type) == Some(self.token_types.parameter) {
+                    return self.add(self.token_types.number, None);
+                }
                 decimal = true;
                 self.advance(1)?;
             } else if (self.peek_char == '-' || self.peek_char == '+') && scientific == 1 {
@@ -491,7 +502,7 @@ impl<'a> TokenizerState<'a> {
             } else if self.peek_char.to_ascii_uppercase() == 'E' && scientific == 0 {
                 scientific += 1;
                 self.advance(1)?;
-            } else if self.is_identifier(self.peek_char) {
+            } else if self.is_alphabetic_or_underscore(self.peek_char) {
                 let number_text = self.text();
                 let mut literal = String::from("");
 
@@ -584,7 +595,7 @@ impl<'a> TokenizerState<'a> {
 
     fn scan_identifier(&mut self, identifier_end: &str) -> Result<(), TokenizerError> {
         self.advance(1)?;
-        let text = self.extract_string(identifier_end, true, true, true)?;
+        let text = self.extract_string(identifier_end, true, false, true)?;
         self.add(self.token_types.identifier, Some(text))
     }
 
@@ -592,7 +603,7 @@ impl<'a> TokenizerState<'a> {
         &mut self,
         delimiter: &str,
         use_identifier_escapes: bool,
-        unescape_sequences: bool,
+        raw_string: bool,
         raise_unmatched: bool,
     ) -> Result<String, TokenizerError> {
         let mut text = String::from("");
@@ -605,7 +616,7 @@ impl<'a> TokenizerState<'a> {
             };
             let peek_char_str = self.peek_char.to_string();
 
-            if unescape_sequences
+            if !raw_string
                 && !self.dialect_settings.unescaped_sequences.is_empty()
                 && !self.peek_char.is_whitespace()
                 && self.settings.string_escapes.contains(&self.current_char)
@@ -620,7 +631,8 @@ impl<'a> TokenizerState<'a> {
                 }
             }
 
-            if escapes.contains(&self.current_char)
+            if (self.settings.string_escapes_allowed_in_raw_strings || !raw_string)
+                && escapes.contains(&self.current_char)
                 && (peek_char_str == delimiter || escapes.contains(&self.peek_char))
                 && (self.current_char == self.peek_char
                     || !self
@@ -673,8 +685,16 @@ impl<'a> TokenizerState<'a> {
         Ok(text)
     }
 
-    fn is_identifier(&mut self, name: char) -> bool {
+    fn is_alphabetic_or_underscore(&mut self, name: char) -> bool {
         name.is_alphabetic() || name == '_'
+    }
+
+    fn is_identifier(&mut self, s: &str) -> bool {
+        s.chars().enumerate().all(
+            |(i, c)|
+            if i == 0 { self.is_alphabetic_or_underscore(c) }
+            else { self.is_alphabetic_or_underscore(c) || c.is_digit(10) }
+        )
     }
 
     fn extract_value(&mut self) -> Result<String, TokenizerError> {

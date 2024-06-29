@@ -92,6 +92,8 @@ class TokenType(AutoName):
     COLUMN_DEF = auto()
     SCHEMA = auto()
     TABLE = auto()
+    WAREHOUSE = auto()
+    STREAMLIT = auto()
     VAR = auto()
     BIT_STRING = auto()
     HEX_STRING = auto()
@@ -234,6 +236,7 @@ class TokenType(AutoName):
     CURRENT_TIME = auto()
     CURRENT_TIMESTAMP = auto()
     CURRENT_USER = auto()
+    DECLARE = auto()
     DEFAULT = auto()
     DELETE = auto()
     DESC = auto()
@@ -284,6 +287,7 @@ class TokenType(AutoName):
     JOIN = auto()
     JOIN_MARKER = auto()
     KEEP = auto()
+    KEY = auto()
     KILL = auto()
     LANGUAGE = auto()
     LATERAL = auto()
@@ -291,6 +295,7 @@ class TokenType(AutoName):
     LIKE = auto()
     LIKE_ANY = auto()
     LIMIT = auto()
+    LIST = auto()
     LOAD = auto()
     LOCK = auto()
     MAP = auto()
@@ -356,8 +361,10 @@ class TokenType(AutoName):
     SORT_BY = auto()
     START_WITH = auto()
     STORAGE_INTEGRATION = auto()
+    STRAIGHT_JOIN = auto()
     STRUCT = auto()
     TABLE_SAMPLE = auto()
+    TAG = auto()
     TEMPORARY = auto()
     TOP = auto()
     THEN = auto()
@@ -519,6 +526,7 @@ class _Tokenizer(type):
                     _TOKEN_TYPE_TO_INDEX[v] for v in klass.COMMAND_PREFIX_TOKENS
                 },
                 heredoc_tag_is_identifier=klass.HEREDOC_TAG_IS_IDENTIFIER,
+                string_escapes_allowed_in_raw_strings=klass.STRING_ESCAPES_ALLOWED_IN_RAW_STRINGS,
             )
             token_types = RsTokenTypeSettings(
                 bit_string=_TOKEN_TYPE_TO_INDEX[TokenType.BIT_STRING],
@@ -594,6 +602,9 @@ class Tokenizer(metaclass=_Tokenizer):
 
     # Token that we'll generate as a fallback if the heredoc prefix doesn't correspond to a heredoc
     HEREDOC_STRING_ALTERNATIVE = TokenType.VAR
+
+    # Whether string escape characters function as such when placed within raw strings
+    STRING_ESCAPES_ALLOWED_IN_RAW_STRINGS = True
 
     # Autofilled
     _COMMENTS: t.Dict[str, str] = {}
@@ -759,6 +770,7 @@ class Tokenizer(metaclass=_Tokenizer):
         "SOME": TokenType.SOME,
         "SORT BY": TokenType.SORT_BY,
         "START WITH": TokenType.START_WITH,
+        "STRAIGHT_JOIN": TokenType.STRAIGHT_JOIN,
         "TABLE": TokenType.TABLE,
         "TABLESAMPLE": TokenType.TABLE_SAMPLE,
         "TEMP": TokenType.TEMPORARY,
@@ -809,6 +821,7 @@ class Tokenizer(metaclass=_Tokenizer):
         "DECIMAL": TokenType.DECIMAL,
         "BIGDECIMAL": TokenType.BIGDECIMAL,
         "BIGNUMERIC": TokenType.BIGDECIMAL,
+        "LIST": TokenType.LIST,
         "MAP": TokenType.MAP,
         "NULLABLE": TokenType.NULLABLE,
         "NUMBER": TokenType.DECIMAL,
@@ -821,6 +834,7 @@ class Tokenizer(metaclass=_Tokenizer):
         "DOUBLE": TokenType.DOUBLE,
         "DOUBLE PRECISION": TokenType.DOUBLE,
         "JSON": TokenType.JSON,
+        "JSONB": TokenType.JSONB,
         "CHAR": TokenType.CHAR,
         "CHARACTER": TokenType.CHAR,
         "NCHAR": TokenType.NCHAR,
@@ -1152,9 +1166,21 @@ class Tokenizer(metaclass=_Tokenizer):
             # Skip the comment's start delimiter
             self._advance(comment_start_size)
 
+            comment_count = 1
             comment_end_size = len(comment_end)
-            while not self._end and self._chars(comment_end_size) != comment_end:
+
+            while not self._end:
+                if self._chars(comment_end_size) == comment_end:
+                    comment_count -= 1
+                    if not comment_count:
+                        break
+
                 self._advance(alnum=True)
+
+                # Nested comments are allowed by some dialects, e.g. databricks, duckdb, postgres
+                if not self._end and self._chars(comment_end_size) == comment_start:
+                    self._advance(comment_start_size)
+                    comment_count += 1
 
             self._comments.append(self._text[comment_start_size : -comment_end_size + 1])
             self._advance(comment_end_size - 1)
@@ -1187,6 +1213,8 @@ class Tokenizer(metaclass=_Tokenizer):
             if self._peek.isdigit():
                 self._advance()
             elif self._peek == "." and not decimal:
+                if self.tokens and self.tokens[-1].token_type == TokenType.PARAMETER:
+                    return self._add(TokenType.NUMBER)
                 decimal = True
                 self._advance()
             elif self._peek in ("-", "+") and scientific == 1:
@@ -1261,18 +1289,6 @@ class Tokenizer(metaclass=_Tokenizer):
             elif token_type == TokenType.BIT_STRING:
                 base = 2
             elif token_type == TokenType.HEREDOC_STRING:
-                if (
-                    self.HEREDOC_TAG_IS_IDENTIFIER
-                    and not self._peek.isidentifier()
-                    and not self._peek == end
-                ):
-                    if self.HEREDOC_STRING_ALTERNATIVE != token_type.VAR:
-                        self._add(self.HEREDOC_STRING_ALTERNATIVE)
-                    else:
-                        self._scan_var()
-
-                    return True
-
                 self._advance()
 
                 if self._char == end:
@@ -1280,11 +1296,14 @@ class Tokenizer(metaclass=_Tokenizer):
                 else:
                     tag = self._extract_string(
                         end,
-                        unescape_sequences=False,
+                        raw_string=True,
                         raise_unmatched=not self.HEREDOC_TAG_IS_IDENTIFIER,
                     )
 
-                if self._end and tag and self.HEREDOC_TAG_IS_IDENTIFIER:
+                if tag and self.HEREDOC_TAG_IS_IDENTIFIER and (self._end or not tag.isidentifier()):
+                    if not self._end:
+                        self._advance(-1)
+
                     self._advance(-len(tag))
                     self._add(self.HEREDOC_STRING_ALTERNATIVE)
                     return True
@@ -1294,7 +1313,7 @@ class Tokenizer(metaclass=_Tokenizer):
             return False
 
         self._advance(len(start))
-        text = self._extract_string(end, unescape_sequences=token_type != TokenType.RAW_STRING)
+        text = self._extract_string(end, raw_string=token_type == TokenType.RAW_STRING)
 
         if base:
             try:
@@ -1330,7 +1349,7 @@ class Tokenizer(metaclass=_Tokenizer):
         self,
         delimiter: str,
         escapes: t.Optional[t.Set[str]] = None,
-        unescape_sequences: bool = True,
+        raw_string: bool = False,
         raise_unmatched: bool = True,
     ) -> str:
         text = ""
@@ -1339,7 +1358,7 @@ class Tokenizer(metaclass=_Tokenizer):
 
         while True:
             if (
-                unescape_sequences
+                not raw_string
                 and self.dialect.UNESCAPED_SEQUENCES
                 and self._peek
                 and self._char in self.STRING_ESCAPES
@@ -1350,7 +1369,8 @@ class Tokenizer(metaclass=_Tokenizer):
                     text += unescaped_sequence
                     continue
             if (
-                self._char in escapes
+                (self.STRING_ESCAPES_ALLOWED_IN_RAW_STRINGS or not raw_string)
+                and self._char in escapes
                 and (self._peek == delimiter or self._peek in escapes)
                 and (self._char not in self._QUOTES or self._char == self._peek)
             ):

@@ -21,6 +21,7 @@ from sqlglot.dialects.dialect import (
     regexp_extract_sql,
     rename_func,
     right_to_substring_sql,
+    sha256_sql,
     struct_extract_sql,
     str_position_sql,
     timestamptrunc_sql,
@@ -32,6 +33,7 @@ from sqlglot.dialects.hive import Hive
 from sqlglot.dialects.mysql import MySQL
 from sqlglot.helper import apply_index_offset, seq_get
 from sqlglot.tokens import TokenType
+from sqlglot.transforms import unqualify_columns
 
 
 def _explode_to_unnest_sql(self: Presto.Generator, expression: exp.Lateral) -> str:
@@ -225,7 +227,7 @@ class Presto(Dialect):
             "TDIGEST": TokenType.TDIGEST,
             "HYPERLOGLOG": TokenType.HLLSKETCH,
         }
-
+        KEYWORDS.pop("/*+")
         KEYWORDS.pop("QUALIFY")
 
     class Parser(parser.Parser):
@@ -276,11 +278,13 @@ class Presto(Dialect):
                 this=seq_get(args, 0), substr=seq_get(args, 1), instance=seq_get(args, 2)
             ),
             "TO_CHAR": _build_to_char,
-            "TO_HEX": exp.Hex.from_arg_list,
             "TO_UNIXTIME": exp.TimeToUnix.from_arg_list,
             "TO_UTF8": lambda args: exp.Encode(
                 this=seq_get(args, 0), charset=exp.Literal.string("utf-8")
             ),
+            "MD5": exp.MD5Digest.from_arg_list,
+            "SHA256": lambda args: exp.SHA2(this=seq_get(args, 0), length=exp.Literal.number(256)),
+            "SHA512": lambda args: exp.SHA2(this=seq_get(args, 0), length=exp.Literal.number(512)),
         }
 
         FUNCTION_PARSERS = parser.Parser.FUNCTION_PARSERS.copy()
@@ -300,6 +304,8 @@ class Presto(Dialect):
         LIKE_PROPERTY_INSIDE_SCHEMA = True
         MULTI_ARG_DISTINCT = False
         SUPPORTS_TO_NUMBER = False
+        HEX_FUNC = "TO_HEX"
+        PARSE_JSON_NAME = "JSON_PARSE"
 
         PROPERTIES_LOCATION = {
             **generator.Generator.PROPERTIES_LOCATION,
@@ -381,11 +387,9 @@ class Presto(Dialect):
             exp.GroupConcat: lambda self, e: self.func(
                 "ARRAY_JOIN", self.func("ARRAY_AGG", e.this), e.args.get("separator")
             ),
-            exp.Hex: rename_func("TO_HEX"),
             exp.If: if_sql(),
             exp.ILike: no_ilike_sql,
             exp.Initcap: _initcap_sql,
-            exp.ParseJSON: rename_func("JSON_PARSE"),
             exp.Last: _first_last_sql,
             exp.LastValue: _first_last_sql,
             exp.LastDay: lambda self, e: self.func("LAST_DAY_OF_MONTH", e.this),
@@ -417,7 +421,7 @@ class Presto(Dialect):
             exp.StructExtract: struct_extract_sql,
             exp.Table: transforms.preprocess([_unnest_sequence]),
             exp.Timestamp: no_timestamp_sql,
-            exp.TimestampTrunc: timestamptrunc_sql,
+            exp.TimestampTrunc: timestamptrunc_sql(),
             exp.TimeStrToDate: timestrtotime_sql,
             exp.TimeStrToTime: timestrtotime_sql,
             exp.TimeStrToUnix: lambda self, e: self.func(
@@ -444,6 +448,12 @@ class Presto(Dialect):
                 [transforms.remove_within_group_for_percentiles]
             ),
             exp.Xor: bool_xor_sql,
+            exp.MD5: lambda self, e: self.func(
+                "LOWER", self.func("TO_HEX", self.func("MD5", self.sql(e, "this")))
+            ),
+            exp.MD5Digest: rename_func("MD5"),
+            exp.SHA: rename_func("SHA1"),
+            exp.SHA2: sha256_sql,
         }
 
         RESERVED_KEYWORDS = {
@@ -615,3 +625,25 @@ class Presto(Dialect):
             if kind == "VIEW" and schema.expressions:
                 expression.this.set("expressions", None)
             return super().create_sql(expression)
+
+        def delete_sql(self, expression: exp.Delete) -> str:
+            """
+            Presto only supports DELETE FROM for a single table without an alias, so we need
+            to remove the unnecessary parts. If the original DELETE statement contains more
+            than one table to be deleted, we can't safely map it 1-1 to a Presto statement.
+            """
+            tables = expression.args.get("tables") or [expression.this]
+            if len(tables) > 1:
+                return super().delete_sql(expression)
+
+            table = tables[0]
+            expression.set("this", table)
+            expression.set("tables", None)
+
+            if isinstance(table, exp.Table):
+                table_alias = table.args.get("alias")
+                if table_alias:
+                    table_alias.pop()
+                    expression = t.cast(exp.Delete, expression.transform(unqualify_columns))
+
+            return super().delete_sql(expression)

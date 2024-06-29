@@ -14,6 +14,8 @@ from sqlglot.errors import ExecuteError
 from sqlglot.executor import execute
 from sqlglot.executor.python import Python
 from sqlglot.executor.table import Table, ensure_tables
+from sqlglot.optimizer import optimize
+from sqlglot.planner import Plan
 from tests.helpers import (
     FIXTURES_DIR,
     SKIP_INTEGRATION,
@@ -707,9 +709,15 @@ class TestExecutor(unittest.TestCase):
             ("ROUND(1.2)", 1),
             ("ROUND(1.2345, 2)", 1.23),
             ("ROUND(NULL)", None),
-            ("UNIXTOTIME(1659981729)", datetime.datetime(2022, 8, 8, 18, 2, 9)),
+            (
+                "UNIXTOTIME(1659981729)",
+                datetime.datetime(2022, 8, 8, 18, 2, 9, tzinfo=datetime.timezone.utc),
+            ),
             ("TIMESTRTOTIME('2013-04-05 01:02:03')", datetime.datetime(2013, 4, 5, 1, 2, 3)),
-            ("UNIXTOTIME(40 * 365 * 86400)", datetime.datetime(2009, 12, 22, 00, 00, 00)),
+            (
+                "UNIXTOTIME(40 * 365 * 86400)",
+                datetime.datetime(2009, 12, 22, 00, 00, 00, tzinfo=datetime.timezone.utc),
+            ),
             (
                 "STRTOTIME('08/03/2024 12:34:56', '%d/%m/%Y %H:%M:%S')",
                 datetime.datetime(2024, 3, 8, 12, 34, 56),
@@ -856,3 +864,18 @@ class TestExecutor(unittest.TestCase):
         result = execute("SELECT x FROM t", dialect="duckdb", tables=tables)
         self.assertEqual(result.columns, ("x",))
         self.assertEqual(result.rows, [([1, 2, 3],)])
+
+    def test_agg_order(self):
+        plan = Plan(
+            optimize("""
+            SELECT
+              AVG(bill_length_mm) AS avg_bill_length,
+              AVG(bill_depth_mm) AS avg_bill_depth
+            FROM penguins
+            """)
+        )
+
+        assert [agg.alias for agg in plan.root.aggregations] == [
+            "avg_bill_length",
+            "avg_bill_depth",
+        ]

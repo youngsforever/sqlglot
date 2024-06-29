@@ -1,5 +1,4 @@
-from sqlglot import exp
-from sqlglot.errors import UnsupportedError
+from sqlglot import exp, UnsupportedError
 from tests.dialects.test_dialect import Validator
 
 
@@ -10,7 +9,7 @@ class TestOracle(Validator):
         self.validate_all(
             "SELECT CONNECT_BY_ROOT x y",
             write={
-                "": "SELECT CONNECT_BY_ROOT(x) AS y",
+                "": "SELECT CONNECT_BY_ROOT x AS y",
                 "oracle": "SELECT CONNECT_BY_ROOT x AS y",
             },
         )
@@ -43,6 +42,7 @@ class TestOracle(Validator):
         self.validate_identity("SELECT * FROM table_name SAMPLE (25) s")
         self.validate_identity("SELECT COUNT(*) * 10 FROM orders SAMPLE (10) SEED (1)")
         self.validate_identity("SELECT * FROM V$SESSION")
+        self.validate_identity("SELECT TO_DATE('January 15, 1989, 11:00 A.M.')")
         self.validate_identity(
             "SELECT last_name, employee_id, manager_id, LEVEL FROM employees START WITH employee_id = 100 CONNECT BY PRIOR employee_id = manager_id ORDER SIBLINGS BY last_name"
         )
@@ -244,12 +244,17 @@ class TestOracle(Validator):
                 "duckdb": "SELECT CAST(STRPTIME('2024-12-12', '%Y-%m-%d') AS DATE)",
             },
         )
+        self.validate_identity(
+            """SELECT * FROM t ORDER BY a ASC NULLS LAST, b ASC NULLS FIRST, c DESC NULLS LAST, d DESC NULLS FIRST""",
+            """SELECT * FROM t ORDER BY a ASC, b ASC NULLS FIRST, c DESC NULLS LAST, d DESC""",
+        )
 
     def test_join_marker(self):
         self.validate_identity("SELECT e1.x, e2.x FROM e e1, e e2 WHERE e1.y (+) = e2.y")
 
         self.validate_all(
-            "SELECT e1.x, e2.x FROM e e1, e e2 WHERE e1.y = e2.y (+)", write={"": UnsupportedError}
+            "SELECT e1.x, e2.x FROM e e1, e e2 WHERE e1.y = e2.y (+)",
+            write={"": UnsupportedError},
         )
         self.validate_all(
             "SELECT e1.x, e2.x FROM e e1, e e2 WHERE e1.y = e2.y (+)",
@@ -413,3 +418,12 @@ WHERE
 
         for query in (f"{body}{start}{connect}", f"{body}{connect}{start}"):
             self.validate_identity(query, pretty, pretty=True)
+
+    def test_query_restrictions(self):
+        for restriction in ("READ ONLY", "CHECK OPTION"):
+            for constraint_name in (" CONSTRAINT name", ""):
+                with self.subTest(f"Restriction: {restriction}"):
+                    self.validate_identity(f"SELECT * FROM tbl WITH {restriction}{constraint_name}")
+                    self.validate_identity(
+                        f"CREATE VIEW view AS SELECT * FROM tbl WITH {restriction}{constraint_name}"
+                    )

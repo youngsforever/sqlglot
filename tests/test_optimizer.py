@@ -10,6 +10,7 @@ import sqlglot
 from sqlglot import exp, optimizer, parse_one
 from sqlglot.errors import OptimizeError, SchemaError
 from sqlglot.optimizer.annotate_types import annotate_types
+from sqlglot.optimizer.normalize import normalization_distance
 from sqlglot.optimizer.scope import build_scope, traverse_scope, walk_in_scope
 from sqlglot.schema import MappingSchema
 from tests.helpers import (
@@ -28,7 +29,11 @@ def parse_and_optimize(func, sql, read_dialect, **kwargs):
 
 def qualify_columns(expression, **kwargs):
     expression = optimizer.qualify.qualify(
-        expression, infer_schema=True, validate_qualify_columns=False, identify=False, **kwargs
+        expression,
+        infer_schema=True,
+        validate_qualify_columns=False,
+        identify=False,
+        **kwargs,
     )
     return expression
 
@@ -110,7 +115,14 @@ class TestOptimizer(unittest.TestCase):
         }
 
     def check_file(
-        self, file, func, pretty=False, execute=False, set_dialect=False, only=None, **kwargs
+        self,
+        file,
+        func,
+        pretty=False,
+        execute=False,
+        set_dialect=False,
+        only=None,
+        **kwargs,
     ):
         with ProcessPoolExecutor() as pool:
             results = {}
@@ -317,8 +329,24 @@ class TestOptimizer(unittest.TestCase):
             'WITH "t" AS (SELECT 1 AS "c") (SELECT "t"."c" AS "c" FROM "t" AS "t")',
         )
 
+        self.assertEqual(
+            optimizer.qualify_columns.qualify_columns(
+                parse_one(
+                    "WITH tbl1 AS (SELECT STRUCT(1 AS `f0`, 2 as f1) AS col) SELECT tbl1.col.* from tbl1",
+                    dialect="bigquery",
+                ),
+                schema=MappingSchema(schema=None, dialect="bigquery"),
+                infer_schema=False,
+            ).sql(dialect="bigquery"),
+            "WITH tbl1 AS (SELECT STRUCT(1 AS `f0`, 2 AS f1) AS col) SELECT tbl1.col.`f0` AS `f0`, tbl1.col.f1 AS f1 FROM tbl1",
+        )
+
         self.check_file(
-            "qualify_columns", qualify_columns, execute=True, schema=self.schema, set_dialect=True
+            "qualify_columns",
+            qualify_columns,
+            execute=True,
+            schema=self.schema,
+            set_dialect=True,
         )
         self.check_file(
             "qualify_columns_ddl", qualify_columns, schema=self.schema, set_dialect=True
@@ -330,7 +358,8 @@ class TestOptimizer(unittest.TestCase):
 
     def test_pushdown_cte_alias_columns(self):
         self.check_file(
-            "pushdown_cte_alias_columns", optimizer.qualify_columns.pushdown_cte_alias_columns
+            "pushdown_cte_alias_columns",
+            optimizer.qualify_columns.pushdown_cte_alias_columns,
         )
 
     def test_qualify_columns__invalid(self):
@@ -392,7 +421,8 @@ class TestOptimizer(unittest.TestCase):
         self.assertEqual(optimizer.simplify.gen(query), optimizer.simplify.gen(query.copy()))
 
         anon_unquoted_identifier = exp.Anonymous(
-            this=exp.to_identifier("anonymous"), expressions=[exp.column("x"), exp.column("y")]
+            this=exp.to_identifier("anonymous"),
+            expressions=[exp.column("x"), exp.column("y")],
         )
         self.assertEqual(optimizer.simplify.gen(anon_unquoted_identifier), "ANONYMOUS(x,y)")
 
@@ -403,7 +433,10 @@ class TestOptimizer(unittest.TestCase):
             anon_invalid = exp.Anonymous(this=5)
             optimizer.simplify.gen(anon_invalid)
 
-        self.assertIn("Anonymous.this expects a str or an Identifier, got 'int'.", str(e.exception))
+        self.assertIn(
+            "Anonymous.this expects a str or an Identifier, got 'int'.",
+            str(e.exception),
+        )
 
         sql = parse_one(
             """
@@ -428,11 +461,7 @@ SELECT :with,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:expr
         )
 
     def test_unnest_subqueries(self):
-        self.check_file(
-            "unnest_subqueries",
-            optimizer.unnest_subqueries.unnest_subqueries,
-            pretty=True,
-        )
+        self.check_file("unnest_subqueries", optimizer.unnest_subqueries.unnest_subqueries)
 
     def test_pushdown_predicates(self):
         self.check_file("pushdown_predicates", optimizer.pushdown_predicates.pushdown_predicates)
@@ -444,13 +473,33 @@ SELECT :with,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:expr
             'SELECT "x"."a" + 1 AS "d", "x"."a" + 1 + 1 AS "e" FROM "x" AS "x" WHERE ("x"."a" + 2) > 1 GROUP BY "x"."a" + 1 + 1',
         )
 
+        unused_schema = {"l": {"c": "int"}}
         self.assertEqual(
             optimizer.qualify_columns.qualify_columns(
                 parse_one("SELECT CAST(x AS INT) AS y FROM z AS z"),
-                schema={"l": {"c": "int"}},
+                schema=unused_schema,
                 infer_schema=False,
             ).sql(),
             "SELECT CAST(x AS INT) AS y FROM z AS z",
+        )
+
+        # BigQuery expands overlapping alias only for GROUP BY + HAVING
+        sql = "WITH data AS (SELECT 1 AS id, 2 AS my_id, 'a' AS name, 'b' AS full_name) SELECT id AS my_id, CONCAT(id, name) AS full_name FROM data WHERE my_id = 1 GROUP BY my_id, full_name HAVING my_id = 1"
+        self.assertEqual(
+            optimizer.qualify_columns.qualify_columns(
+                parse_one(sql, dialect="bigquery"),
+                schema=MappingSchema(schema=unused_schema, dialect="bigquery"),
+            ).sql(),
+            "WITH data AS (SELECT 1 AS id, 2 AS my_id, 'a' AS name, 'b' AS full_name) SELECT data.id AS my_id, CONCAT(data.id, data.name) AS full_name FROM data WHERE data.my_id = 1 GROUP BY data.id, CONCAT(data.id, data.name) HAVING data.id = 1",
+        )
+
+        # Clickhouse expands overlapping alias across the entire query
+        self.assertEqual(
+            optimizer.qualify_columns.qualify_columns(
+                parse_one(sql, dialect="clickhouse"),
+                schema=MappingSchema(schema=unused_schema, dialect="clickhouse"),
+            ).sql(),
+            "WITH data AS (SELECT 1 AS id, 2 AS my_id, 'a' AS name, 'b' AS full_name) SELECT data.id AS my_id, CONCAT(data.id, data.name) AS full_name FROM data WHERE data.id = 1 GROUP BY data.id, CONCAT(data.id, data.name) HAVING data.id = 1",
         )
 
     def test_optimize_joins(self):
@@ -897,7 +946,8 @@ FROM READ_CSV('tests/fixtures/optimizer/tpc-h/nation.csv.gz', 'delimiter', '|') 
 
         # Check that x.cola AS cola and y.colb AS colb have types CHAR and TEXT, respectively
         for d, t in zip(
-            cte_select.find_all(exp.Subquery), [exp.DataType.Type.CHAR, exp.DataType.Type.TEXT]
+            cte_select.find_all(exp.Subquery),
+            [exp.DataType.Type.CHAR, exp.DataType.Type.TEXT],
         ):
             self.assertEqual(d.this.expressions[0].this.type.this, t)
 
@@ -1011,7 +1061,8 @@ FROM READ_CSV('tests/fixtures/optimizer/tpc-h/nation.csv.gz', 'delimiter', '|') 
 
         for (func, col), target_type in tests.items():
             expression = annotate_types(
-                parse_one(f"SELECT {func}(x.{col}) AS _col_0 FROM x AS x"), schema=schema
+                parse_one(f"SELECT {func}(x.{col}) AS _col_0 FROM x AS x"),
+                schema=schema,
             )
             self.assertEqual(expression.expressions[0].type.this, target_type)
 
@@ -1026,7 +1077,13 @@ FROM READ_CSV('tests/fixtures/optimizer/tpc-h/nation.csv.gz', 'delimiter', '|') 
         self.assertEqual(exp.DataType.Type.INT, expression.selects[1].type.this)
 
     def test_nested_type_annotation(self):
-        schema = {"order": {"customer_id": "bigint", "item_id": "bigint", "item_price": "numeric"}}
+        schema = {
+            "order": {
+                "customer_id": "bigint",
+                "item_id": "bigint",
+                "item_price": "numeric",
+            }
+        }
         sql = """
             SELECT ARRAY_AGG(DISTINCT order.item_id) FILTER (WHERE order.item_price > 10) AS items,
             FROM order AS order
@@ -1048,7 +1105,8 @@ FROM READ_CSV('tests/fixtures/optimizer/tpc-h/nation.csv.gz', 'delimiter', '|') 
 
         self.assertEqual(expression.selects[0].type.sql(dialect="bigquery"), "STRUCT<`f` STRING>")
         self.assertEqual(
-            expression.selects[1].type.sql(dialect="bigquery"), "ARRAY<STRUCT<`f` STRING>>"
+            expression.selects[1].type.sql(dialect="bigquery"),
+            "ARRAY<STRUCT<`f` STRING>>",
         )
 
         expression = annotate_types(
@@ -1197,7 +1255,8 @@ FROM READ_CSV('tests/fixtures/optimizer/tpc-h/nation.csv.gz', 'delimiter', '|') 
 
         self.assertEqual(
             optimizer.optimize(
-                parse_one("SELECT * FROM a"), schema=MappingSchema(schema, dialect="bigquery")
+                parse_one("SELECT * FROM a"),
+                schema=MappingSchema(schema, dialect="bigquery"),
             ),
             parse_one('SELECT "a"."a" AS "a", "a"."b" AS "b" FROM "a" AS "a"'),
         )
@@ -1206,3 +1265,11 @@ FROM READ_CSV('tests/fixtures/optimizer/tpc-h/nation.csv.gz', 'delimiter', '|') 
         query = parse_one("select a.b:c from d", read="snowflake")
         qualified = optimizer.qualify.qualify(query)
         self.assertEqual(qualified.expressions[0].alias, "c")
+
+    def test_normalization_distance(self):
+        def gen_expr(depth: int) -> exp.Expression:
+            return parse_one(" OR ".join("a AND b" for _ in range(depth)))
+
+        self.assertEqual(4, normalization_distance(gen_expr(2), max_=100))
+        self.assertEqual(18, normalization_distance(gen_expr(3), max_=100))
+        self.assertEqual(110, normalization_distance(gen_expr(10), max_=100))

@@ -1,19 +1,21 @@
 from sqlglot import exp, parse, parse_one
-from sqlglot.parser import logger as parser_logger
 from tests.dialects.test_dialect import Validator
 from sqlglot.errors import ParseError
+from sqlglot.optimizer.annotate_types import annotate_types
 
 
 class TestTSQL(Validator):
     dialect = "tsql"
 
     def test_tsql(self):
-        self.validate_identity("ROUND(x, 1, 0)")
-        self.validate_identity("EXEC MyProc @id=7, @name='Lochristi'", check_command_warning=True)
         # https://learn.microsoft.com/en-us/previous-versions/sql/sql-server-2008-r2/ms187879(v=sql.105)?redirectedfrom=MSDN
         # tsql allows .. which means use the default schema
         self.validate_identity("SELECT * FROM a..b")
 
+        self.validate_identity("CREATE view a.b.c", "CREATE VIEW b.c")
+        self.validate_identity("DROP view a.b.c", "DROP VIEW b.c")
+        self.validate_identity("ROUND(x, 1, 0)")
+        self.validate_identity("EXEC MyProc @id=7, @name='Lochristi'", check_command_warning=True)
         self.validate_identity("SELECT TRIM('     test    ') AS Result")
         self.validate_identity("SELECT TRIM('.,! ' FROM '     #     test    .') AS Result")
         self.validate_identity("SELECT * FROM t TABLESAMPLE (10 PERCENT)")
@@ -30,7 +32,20 @@ class TestTSQL(Validator):
         self.validate_identity("CAST(x AS int) OR y", "CAST(x AS INTEGER) <> 0 OR y <> 0")
         self.validate_identity("TRUNCATE TABLE t1 WITH (PARTITIONS(1, 2 TO 5, 10 TO 20, 84))")
         self.validate_identity(
-            "COPY INTO test_1 FROM 'path' WITH (FILE_TYPE = 'CSV', CREDENTIAL = (IDENTITY = 'Shared Access Signature', SECRET = 'token'), FIELDTERMINATOR = ';', ROWTERMINATOR = '0X0A', ENCODING = 'UTF8', DATEFORMAT = 'ymd', MAXERRORS = 10, ERRORFILE = 'errorsfolder', IDENTITY_INSERT = 'ON')"
+            "CREATE CLUSTERED INDEX [IX_OfficeTagDetail_TagDetailID] ON [dbo].[OfficeTagDetail]([TagDetailID] ASC)"
+        )
+        self.validate_identity(
+            "CREATE INDEX [x] ON [y]([z] ASC) WITH (allow_page_locks=on) ON X([y])"
+        )
+        self.validate_identity(
+            "CREATE INDEX [x] ON [y]([z] ASC) WITH (allow_page_locks=on) ON PRIMARY"
+        )
+        self.validate_identity(
+            "COPY INTO test_1 FROM 'path' WITH (FORMAT_NAME = test, FILE_TYPE = 'CSV', CREDENTIAL = (IDENTITY='Shared Access Signature', SECRET='token'), FIELDTERMINATOR = ';', ROWTERMINATOR = '0X0A', ENCODING = 'UTF8', DATEFORMAT = 'ymd', MAXERRORS = 10, ERRORFILE = 'errorsfolder', IDENTITY_INSERT = 'ON')"
+        )
+        self.assertEqual(
+            annotate_types(self.validate_identity("SELECT 1 WHERE EXISTS(SELECT 1)")).sql("tsql"),
+            "SELECT 1 WHERE EXISTS(SELECT 1)",
         )
 
         self.validate_all(
@@ -191,16 +206,9 @@ class TestTSQL(Validator):
         )
 
         self.validate_all(
-            """
-            CREATE TABLE x(
-                [zip_cd] [varchar](5) NULL NOT FOR REPLICATION,
-                [zip_cd_mkey] [varchar](5) NOT NULL,
-                CONSTRAINT [pk_mytable] PRIMARY KEY CLUSTERED ([zip_cd_mkey] ASC)
-                WITH (PAD_INDEX = ON, STATISTICS_NORECOMPUTE = OFF) ON [INDEX]
-            ) ON [SECONDARY]
-            """,
+            """CREATE TABLE x ([zip_cd] VARCHAR(5) NULL NOT FOR REPLICATION, [zip_cd_mkey] VARCHAR(5) NOT NULL, CONSTRAINT [pk_mytable] PRIMARY KEY CLUSTERED ([zip_cd_mkey] ASC) WITH (PAD_INDEX=ON, STATISTICS_NORECOMPUTE=OFF) ON [INDEX]) ON [SECONDARY]""",
             write={
-                "tsql": "CREATE TABLE x ([zip_cd] VARCHAR(5) NULL NOT FOR REPLICATION, [zip_cd_mkey] VARCHAR(5) NOT NULL, CONSTRAINT [pk_mytable] PRIMARY KEY CLUSTERED ([zip_cd_mkey] ASC)  WITH (PAD_INDEX=ON, STATISTICS_NORECOMPUTE=OFF) ON [INDEX]) ON [SECONDARY]",
+                "tsql": "CREATE TABLE x ([zip_cd] VARCHAR(5) NULL NOT FOR REPLICATION, [zip_cd_mkey] VARCHAR(5) NOT NULL, CONSTRAINT [pk_mytable] PRIMARY KEY CLUSTERED ([zip_cd_mkey] ASC) WITH (PAD_INDEX=ON, STATISTICS_NORECOMPUTE=OFF) ON [INDEX]) ON [SECONDARY]",
                 "spark2": "CREATE TABLE x (`zip_cd` VARCHAR(5), `zip_cd_mkey` VARCHAR(5) NOT NULL, CONSTRAINT `pk_mytable` PRIMARY KEY (`zip_cd_mkey`))",
             },
         )
@@ -223,9 +231,9 @@ class TestTSQL(Validator):
             "CREATE TABLE [db].[tbl] ([a] INTEGER)",
         )
 
-        projection = parse_one("SELECT a = 1", read="tsql").selects[0]
-        projection.assert_is(exp.Alias)
-        projection.args["alias"].assert_is(exp.Identifier)
+        self.validate_identity("SELECT a = 1", "SELECT 1 AS a").selects[0].assert_is(
+            exp.Alias
+        ).args["alias"].assert_is(exp.Identifier)
 
         self.validate_all(
             "IF OBJECT_ID('tempdb.dbo.#TempTableName', 'U') IS NOT NULL DROP TABLE #TempTableName",
@@ -259,7 +267,7 @@ class TestTSQL(Validator):
         self.validate_identity("SELECT * FROM ##foo")
         self.validate_identity("SELECT a = 1", "SELECT 1 AS a")
         self.validate_identity(
-            "DECLARE @TestVariable AS VARCHAR(100)='Save Our Planet'", check_command_warning=True
+            "DECLARE @TestVariable AS VARCHAR(100) = 'Save Our Planet'",
         )
         self.validate_identity(
             "SELECT a = 1 UNION ALL SELECT a = b", "SELECT 1 AS a UNION ALL SELECT b AS a"
@@ -461,6 +469,7 @@ class TestTSQL(Validator):
         self.validate_identity("CAST(x AS IMAGE)")
         self.validate_identity("CAST(x AS SQL_VARIANT)")
         self.validate_identity("CAST(x AS BIT)")
+
         self.validate_all(
             "CAST(x AS DATETIME2)",
             read={
@@ -488,7 +497,7 @@ class TestTSQL(Validator):
             },
         )
 
-    def test__types_ints(self):
+    def test_types_ints(self):
         self.validate_all(
             "CAST(X AS INT)",
             write={
@@ -521,10 +530,14 @@ class TestTSQL(Validator):
 
         self.validate_all(
             "CAST(X AS TINYINT)",
+            read={
+                "duckdb": "CAST(X AS UTINYINT)",
+            },
             write={
-                "hive": "CAST(X AS TINYINT)",
-                "spark2": "CAST(X AS TINYINT)",
-                "spark": "CAST(X AS TINYINT)",
+                "duckdb": "CAST(X AS UTINYINT)",
+                "hive": "CAST(X AS SMALLINT)",
+                "spark2": "CAST(X AS SMALLINT)",
+                "spark": "CAST(X AS SMALLINT)",
                 "tsql": "CAST(X AS TINYINT)",
             },
         )
@@ -757,24 +770,35 @@ class TestTSQL(Validator):
         for view_attr in ("ENCRYPTION", "SCHEMABINDING", "VIEW_METADATA"):
             self.validate_identity(f"CREATE VIEW a.b WITH {view_attr} AS SELECT * FROM x")
 
-        expression = parse_one("ALTER TABLE dbo.DocExe DROP CONSTRAINT FK_Column_B", dialect="tsql")
-        self.assertIsInstance(expression, exp.AlterTable)
-        self.assertIsInstance(expression.args["actions"][0], exp.Drop)
-        self.assertEqual(
-            expression.sql(dialect="tsql"), "ALTER TABLE dbo.DocExe DROP CONSTRAINT FK_Column_B"
-        )
+        self.validate_identity("ALTER TABLE dbo.DocExe DROP CONSTRAINT FK_Column_B").assert_is(
+            exp.AlterTable
+        ).args["actions"][0].assert_is(exp.Drop)
 
-        for clusterd_keyword in ("CLUSTERED", "NONCLUSTERED"):
+        for clustered_keyword in ("CLUSTERED", "NONCLUSTERED"):
             self.validate_identity(
                 'CREATE TABLE "dbo"."benchmark" ('
                 '"name" CHAR(7) NOT NULL, '
                 '"internal_id" VARCHAR(10) NOT NULL, '
-                f'UNIQUE {clusterd_keyword} ("internal_id" ASC))',
+                f'UNIQUE {clustered_keyword} ("internal_id" ASC))',
                 "CREATE TABLE [dbo].[benchmark] ("
                 "[name] CHAR(7) NOT NULL, "
                 "[internal_id] VARCHAR(10) NOT NULL, "
-                f"UNIQUE {clusterd_keyword} ([internal_id] ASC))",
+                f"UNIQUE {clustered_keyword} ([internal_id] ASC))",
             )
+
+        self.validate_identity(
+            "ALTER TABLE tbl SET SYSTEM_VERSIONING=ON(HISTORY_TABLE=db.tbl, DATA_CONSISTENCY_CHECK=OFF, HISTORY_RETENTION_PERIOD=5 DAYS)"
+        )
+        self.validate_identity(
+            "ALTER TABLE tbl SET SYSTEM_VERSIONING=ON(HISTORY_TABLE=db.tbl, HISTORY_RETENTION_PERIOD=INFINITE)"
+        )
+        self.validate_identity("ALTER TABLE tbl SET SYSTEM_VERSIONING=OFF")
+        self.validate_identity("ALTER TABLE tbl SET FILESTREAM_ON = 'test'")
+        self.validate_identity(
+            "ALTER TABLE tbl SET DATA_DELETION=ON(FILTER_COLUMN=col, RETENTION_PERIOD=5 MONTHS)"
+        )
+        self.validate_identity("ALTER TABLE tbl SET DATA_DELETION=ON")
+        self.validate_identity("ALTER TABLE tbl SET DATA_DELETION=OFF")
 
         self.validate_identity(
             "CREATE PROCEDURE foo AS BEGIN DELETE FROM bla WHERE foo < CURRENT_TIMESTAMP - 7 END",
@@ -782,10 +806,10 @@ class TestTSQL(Validator):
         )
 
         self.validate_all(
-            "CREATE TABLE [#temptest] (name VARCHAR)",
+            "CREATE TABLE [#temptest] (name INTEGER)",
             read={
-                "duckdb": "CREATE TEMPORARY TABLE 'temptest' (name VARCHAR)",
-                "tsql": "CREATE TABLE [#temptest] (name VARCHAR)",
+                "duckdb": "CREATE TEMPORARY TABLE 'temptest' (name INTEGER)",
+                "tsql": "CREATE TABLE [#temptest] (name INTEGER)",
             },
         )
         self.validate_all(
@@ -900,8 +924,7 @@ class TestTSQL(Validator):
 
     def test_udf(self):
         self.validate_identity(
-            "DECLARE @DWH_DateCreated DATETIME = CONVERT(DATETIME, getdate(), 104)",
-            check_command_warning=True,
+            "DECLARE @DWH_DateCreated AS DATETIME2 = CONVERT(DATETIME2, GETDATE(), 104)",
         )
         self.validate_identity(
             "CREATE PROCEDURE foo @a INTEGER, @b INTEGER AS SELECT @a = SUM(bla) FROM baz AS bar"
@@ -973,9 +996,9 @@ WHERE
             BEGIN
                 SET XACT_ABORT ON;
 
-                DECLARE @DWH_DateCreated DATETIME = CONVERT(DATETIME, getdate(), 104);
-                DECLARE @DWH_DateModified DATETIME = CONVERT(DATETIME, getdate(), 104);
-                DECLARE @DWH_IdUserCreated INTEGER = SUSER_ID (SYSTEM_USER);
+                DECLARE @DWH_DateCreated AS DATETIME = CONVERT(DATETIME, getdate(), 104);
+                DECLARE @DWH_DateModified DATETIME2 = CONVERT(DATETIME2, GETDATE(), 104);
+                DECLARE @DWH_IdUserCreated INTEGER = SUSER_ID (CURRENT_USER());
                 DECLARE @DWH_IdUserModified INTEGER = SUSER_ID (SYSTEM_USER);
 
                 DECLARE @SalesAmountBefore float;
@@ -985,18 +1008,17 @@ WHERE
 
         expected_sqls = [
             "CREATE PROCEDURE [TRANSF].[SP_Merge_Sales_Real] @Loadid INTEGER, @NumberOfRows INTEGER AS BEGIN SET XACT_ABORT ON",
-            "DECLARE @DWH_DateCreated DATETIME = CONVERT(DATETIME, getdate(), 104)",
-            "DECLARE @DWH_DateModified DATETIME = CONVERT(DATETIME, getdate(), 104)",
-            "DECLARE @DWH_IdUserCreated INTEGER = SUSER_ID (SYSTEM_USER)",
-            "DECLARE @DWH_IdUserModified INTEGER = SUSER_ID (SYSTEM_USER)",
-            "DECLARE @SalesAmountBefore float",
+            "DECLARE @DWH_DateCreated AS DATETIME2 = CONVERT(DATETIME2, GETDATE(), 104)",
+            "DECLARE @DWH_DateModified AS DATETIME2 = CONVERT(DATETIME2, GETDATE(), 104)",
+            "DECLARE @DWH_IdUserCreated AS INTEGER = SUSER_ID(CURRENT_USER())",
+            "DECLARE @DWH_IdUserModified AS INTEGER = SUSER_ID(CURRENT_USER())",
+            "DECLARE @SalesAmountBefore AS FLOAT",
             "SELECT @SalesAmountBefore = SUM(SalesAmount) FROM TRANSF.[Pre_Merge_Sales_Real] AS S",
             "END",
         ]
 
-        with self.assertLogs(parser_logger):
-            for expr, expected_sql in zip(parse(sql, read="tsql"), expected_sqls):
-                self.assertEqual(expr.sql(dialect="tsql"), expected_sql)
+        for expr, expected_sql in zip(parse(sql, read="tsql"), expected_sqls):
+            self.assertEqual(expr.sql(dialect="tsql"), expected_sql)
 
         sql = """
             CREATE PROC [dbo].[transform_proc] AS
@@ -1010,14 +1032,13 @@ WHERE
         """
 
         expected_sqls = [
-            "CREATE PROC [dbo].[transform_proc] AS DECLARE @CurrentDate VARCHAR(20)",
+            "CREATE PROC [dbo].[transform_proc] AS DECLARE @CurrentDate AS VARCHAR(20)",
             "SET @CurrentDate = CONVERT(VARCHAR(20), GETDATE(), 120)",
             "CREATE TABLE [target_schema].[target_table] (a INTEGER) WITH (DISTRIBUTION=REPLICATE, HEAP)",
         ]
 
-        with self.assertLogs(parser_logger):
-            for expr, expected_sql in zip(parse(sql, read="tsql"), expected_sqls):
-                self.assertEqual(expr.sql(dialect="tsql"), expected_sql)
+        for expr, expected_sql in zip(parse(sql, read="tsql"), expected_sqls):
+            self.assertEqual(expr.sql(dialect="tsql"), expected_sql)
 
     def test_charindex(self):
         self.validate_identity(
@@ -1083,7 +1104,13 @@ WHERE
         self.validate_all("LEN('x')", write={"tsql": "LEN('x')", "spark": "LENGTH('x')"})
 
     def test_replicate(self):
-        self.validate_all("REPLICATE('x', 2)", write={"spark": "REPEAT('x', 2)"})
+        self.validate_all(
+            "REPLICATE('x', 2)",
+            write={
+                "spark": "REPEAT('x', 2)",
+                "tsql": "REPLICATE('x', 2)",
+            },
+        )
 
     def test_isnull(self):
         self.validate_all("ISNULL(x, y)", write={"spark": "COALESCE(x, y)"})
@@ -1616,27 +1643,23 @@ WHERE
         )
 
     def test_identifier_prefixes(self):
-        expr = parse_one("#x", read="tsql")
-        self.assertIsInstance(expr, exp.Column)
-        self.assertIsInstance(expr.this, exp.Identifier)
-        self.assertTrue(expr.this.args.get("temporary"))
-        self.assertEqual(expr.sql("tsql"), "#x")
+        self.assertTrue(
+            self.validate_identity("#x")
+            .assert_is(exp.Column)
+            .this.assert_is(exp.Identifier)
+            .args.get("temporary")
+        )
+        self.assertTrue(
+            self.validate_identity("##x")
+            .assert_is(exp.Column)
+            .this.assert_is(exp.Identifier)
+            .args.get("global")
+        )
 
-        expr = parse_one("##x", read="tsql")
-        self.assertIsInstance(expr, exp.Column)
-        self.assertIsInstance(expr.this, exp.Identifier)
-        self.assertTrue(expr.this.args.get("global"))
-        self.assertEqual(expr.sql("tsql"), "##x")
-
-        expr = parse_one("@x", read="tsql")
-        self.assertIsInstance(expr, exp.Parameter)
-        self.assertIsInstance(expr.this, exp.Var)
-        self.assertEqual(expr.sql("tsql"), "@x")
-
-        table = parse_one("select * from @x", read="tsql").args["from"].this
-        self.assertIsInstance(table, exp.Table)
-        self.assertIsInstance(table.this, exp.Parameter)
-        self.assertIsInstance(table.this.this, exp.Var)
+        self.validate_identity("@x").assert_is(exp.Parameter).this.assert_is(exp.Var)
+        self.validate_identity("SELECT * FROM @x").args["from"].this.assert_is(
+            exp.Table
+        ).this.assert_is(exp.Parameter).this.assert_is(exp.Var)
 
         self.validate_all(
             "SELECT @x",
@@ -1647,8 +1670,6 @@ WHERE
                 "tsql": "SELECT @x",
             },
         )
-
-    def test_temp_table(self):
         self.validate_all(
             "SELECT * FROM #mytemptable",
             write={
@@ -1823,3 +1844,55 @@ FROM OPENJSON(@json) WITH (
                 "duckdb": "WITH t1(c) AS (SELECT 1), t2 AS (SELECT CAST(c AS INTEGER) FROM t1) SELECT * FROM t2",
             },
         )
+
+    def test_declare(self):
+        # supported cases
+        self.validate_identity("DECLARE @X INT", "DECLARE @X AS INTEGER")
+        self.validate_identity("DECLARE @X INT = 1", "DECLARE @X AS INTEGER = 1")
+        self.validate_identity(
+            "DECLARE @X INT, @Y VARCHAR(10)", "DECLARE @X AS INTEGER, @Y AS VARCHAR(10)"
+        )
+        self.validate_identity(
+            "declare @X int = (select col from table where id = 1)",
+            "DECLARE @X AS INTEGER = (SELECT col FROM table WHERE id = 1)",
+        )
+        self.validate_identity(
+            "declare @X TABLE (Id INT NOT NULL, Name VARCHAR(100) NOT NULL)",
+            "DECLARE @X AS TABLE (Id INTEGER NOT NULL, Name VARCHAR(100) NOT NULL)",
+        )
+        self.validate_identity(
+            "declare @X TABLE (Id INT NOT NULL, constraint PK_Id primary key (Id))",
+            "DECLARE @X AS TABLE (Id INTEGER NOT NULL, CONSTRAINT PK_Id PRIMARY KEY (Id))",
+        )
+        self.validate_identity(
+            "declare @X UserDefinedTableType",
+            "DECLARE @X AS UserDefinedTableType",
+        )
+        self.validate_identity(
+            "DECLARE @MyTableVar TABLE (EmpID INT NOT NULL, PRIMARY KEY CLUSTERED (EmpID), UNIQUE NONCLUSTERED (EmpID), INDEX CustomNonClusteredIndex NONCLUSTERED (EmpID))",
+            check_command_warning=True,
+        )
+        self.validate_identity(
+            "DECLARE vendor_cursor CURSOR FOR SELECT VendorID, Name FROM Purchasing.Vendor WHERE PreferredVendorStatus = 1 ORDER BY VendorID",
+            check_command_warning=True,
+        )
+
+    def test_scope_resolution_op(self):
+        # we still want to support :: casting shorthand for tsql
+        self.validate_identity("x::int", "CAST(x AS INTEGER)")
+
+        for lhs, rhs in (
+            ("", "FOO(a, b)"),
+            ("bar", "baZ(1, 2)"),
+            ("LOGIN", "EricKurjan"),
+            ("GEOGRAPHY", "Point(latitude, longitude, 4326)"),
+            (
+                "GEOGRAPHY",
+                "STGeomFromText('POLYGON((-122.358 47.653 , -122.348 47.649, -122.348 47.658, -122.358 47.658, -122.358 47.653))', 4326)",
+            ),
+        ):
+            with self.subTest(f"Scope resolution, LHS: {lhs}, RHS: {rhs}"):
+                expr = self.validate_identity(f"{lhs}::{rhs}")
+                base_sql = expr.sql()
+                self.assertEqual(base_sql, f"SCOPE_RESOLUTION({lhs + ', ' if lhs else ''}{rhs})")
+                self.assertEqual(parse_one(base_sql).sql("tsql"), f"{lhs}::{rhs}")

@@ -75,6 +75,26 @@ def _transform_create(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
+def _generated_to_auto_increment(expression: exp.Expression) -> exp.Expression:
+    if not isinstance(expression, exp.ColumnDef):
+        return expression
+
+    generated = expression.find(exp.GeneratedAsIdentityColumnConstraint)
+
+    if generated:
+        t.cast(exp.ColumnConstraint, generated.parent).pop()
+
+        not_null = expression.find(exp.NotNullColumnConstraint)
+        if not_null:
+            t.cast(exp.ColumnConstraint, not_null.parent).pop()
+
+        expression.append(
+            "constraints", exp.ColumnConstraint(kind=exp.AutoIncrementColumnConstraint())
+        )
+
+    return expression
+
+
 class SQLite(Dialect):
     # https://sqlite.org/forum/forumpost/5e575586ac5c711b?raw
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE
@@ -86,11 +106,16 @@ class SQLite(Dialect):
         IDENTIFIERS = ['"', ("[", "]"), "`"]
         HEX_STRINGS = [("x'", "'"), ("X'", "'"), ("0x", ""), ("0X", "")]
 
+        KEYWORDS = tokens.Tokenizer.KEYWORDS.copy()
+        KEYWORDS.pop("/*+")
+
     class Parser(parser.Parser):
         FUNCTIONS = {
             **parser.Parser.FUNCTIONS,
             "EDITDIST3": exp.Levenshtein.from_arg_list,
             "STRFTIME": _build_strftime,
+            "DATETIME": lambda args: exp.Anonymous(this="DATETIME", expressions=args),
+            "TIME": lambda args: exp.Anonymous(this="TIME", expressions=args),
         }
         STRING_ALIASES = True
 
@@ -141,6 +166,7 @@ class SQLite(Dialect):
             exp.CurrentDate: lambda *_: "CURRENT_DATE",
             exp.CurrentTime: lambda *_: "CURRENT_TIME",
             exp.CurrentTimestamp: lambda *_: "CURRENT_TIMESTAMP",
+            exp.ColumnDef: transforms.preprocess([_generated_to_auto_increment]),
             exp.DateAdd: _date_add_sql,
             exp.DateStrToDate: lambda self, e: self.sql(e, "this"),
             exp.If: rename_func("IIF"),

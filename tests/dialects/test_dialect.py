@@ -121,6 +121,12 @@ class TestDialect(Validator):
 
         self.assertEqual(str(cm.exception), "Unknown dialect 'asdfjasodiufjsd'.")
 
+        oracle_with_settings = Dialect.get_or_raise(
+            "oracle, normalization_strategy = lowercase, version = 19.5"
+        )
+        self.assertEqual(oracle_with_settings.normalization_strategy.value, "LOWERCASE")
+        self.assertEqual(oracle_with_settings.settings, {"version": "19.5"})
+
     def test_compare_dialects(self):
         bigquery_class = Dialect["bigquery"]
         bigquery_object = BigQuery()
@@ -155,6 +161,7 @@ class TestDialect(Validator):
                 "clickhouse": "CAST(a AS String)",
                 "drill": "CAST(a AS VARCHAR)",
                 "duckdb": "CAST(a AS TEXT)",
+                "materialize": "CAST(a AS TEXT)",
                 "mysql": "CAST(a AS CHAR)",
                 "hive": "CAST(a AS STRING)",
                 "oracle": "CAST(a AS CLOB)",
@@ -175,6 +182,7 @@ class TestDialect(Validator):
                 "clickhouse": "CAST(a AS BINARY(4))",
                 "drill": "CAST(a AS VARBINARY(4))",
                 "duckdb": "CAST(a AS BLOB(4))",
+                "materialize": "CAST(a AS BYTEA(4))",
                 "mysql": "CAST(a AS BINARY(4))",
                 "hive": "CAST(a AS BINARY(4))",
                 "oracle": "CAST(a AS BLOB(4))",
@@ -193,6 +201,7 @@ class TestDialect(Validator):
                 "bigquery": "CAST(a AS BYTES)",
                 "clickhouse": "CAST(a AS String)",
                 "duckdb": "CAST(a AS BLOB(4))",
+                "materialize": "CAST(a AS BYTEA(4))",
                 "mysql": "CAST(a AS VARBINARY(4))",
                 "hive": "CAST(a AS BINARY(4))",
                 "oracle": "CAST(a AS BLOB(4))",
@@ -236,6 +245,7 @@ class TestDialect(Validator):
                 "bigquery": "CAST(a AS STRING)",
                 "drill": "CAST(a AS VARCHAR)",
                 "duckdb": "CAST(a AS TEXT)",
+                "materialize": "CAST(a AS TEXT)",
                 "mysql": "CAST(a AS CHAR)",
                 "hive": "CAST(a AS STRING)",
                 "oracle": "CAST(a AS CLOB)",
@@ -255,6 +265,7 @@ class TestDialect(Validator):
                 "bigquery": "CAST(a AS STRING)",
                 "drill": "CAST(a AS VARCHAR)",
                 "duckdb": "CAST(a AS TEXT)",
+                "materialize": "CAST(a AS VARCHAR)",
                 "mysql": "CAST(a AS CHAR)",
                 "hive": "CAST(a AS STRING)",
                 "oracle": "CAST(a AS VARCHAR2)",
@@ -274,6 +285,7 @@ class TestDialect(Validator):
                 "bigquery": "CAST(a AS STRING)",
                 "drill": "CAST(a AS VARCHAR(3))",
                 "duckdb": "CAST(a AS TEXT(3))",
+                "materialize": "CAST(a AS VARCHAR(3))",
                 "mysql": "CAST(a AS CHAR(3))",
                 "hive": "CAST(a AS VARCHAR(3))",
                 "oracle": "CAST(a AS VARCHAR2(3))",
@@ -293,6 +305,7 @@ class TestDialect(Validator):
                 "bigquery": "CAST(a AS INT64)",
                 "drill": "CAST(a AS INTEGER)",
                 "duckdb": "CAST(a AS SMALLINT)",
+                "materialize": "CAST(a AS SMALLINT)",
                 "mysql": "CAST(a AS SIGNED)",
                 "hive": "CAST(a AS SMALLINT)",
                 "oracle": "CAST(a AS NUMBER)",
@@ -328,6 +341,7 @@ class TestDialect(Validator):
                 "clickhouse": "CAST(a AS Float64)",
                 "drill": "CAST(a AS DOUBLE)",
                 "duckdb": "CAST(a AS DOUBLE)",
+                "materialize": "CAST(a AS DOUBLE PRECISION)",
                 "mysql": "CAST(a AS DOUBLE)",
                 "hive": "CAST(a AS DOUBLE)",
                 "oracle": "CAST(a AS DOUBLE PRECISION)",
@@ -599,6 +613,7 @@ class TestDialect(Validator):
                 "drill": "TO_TIMESTAMP(x, 'yy')",
                 "duckdb": "STRPTIME(x, '%y')",
                 "hive": "CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(x, 'yy')) AS TIMESTAMP)",
+                "materialize": "TO_TIMESTAMP(x, 'YY')",
                 "presto": "DATE_PARSE(x, '%y')",
                 "oracle": "TO_TIMESTAMP(x, 'YY')",
                 "postgres": "TO_TIMESTAMP(x, 'YY')",
@@ -655,6 +670,7 @@ class TestDialect(Validator):
                 "drill": "TO_CHAR(x, 'yyyy-MM-dd')",
                 "duckdb": "STRFTIME(x, '%Y-%m-%d')",
                 "hive": "DATE_FORMAT(x, 'yyyy-MM-dd')",
+                "materialize": "TO_CHAR(x, 'YYYY-MM-DD')",
                 "oracle": "TO_CHAR(x, 'YYYY-MM-DD')",
                 "postgres": "TO_CHAR(x, 'YYYY-MM-DD')",
                 "presto": "DATE_FORMAT(x, '%Y-%m-%d')",
@@ -698,6 +714,7 @@ class TestDialect(Validator):
                 "bigquery": "CAST(x AS DATE)",
                 "duckdb": "CAST(x AS DATE)",
                 "hive": "TO_DATE(x)",
+                "materialize": "CAST(x AS DATE)",
                 "postgres": "CAST(x AS DATE)",
                 "presto": "CAST(CAST(x AS TIMESTAMP) AS DATE)",
                 "snowflake": "TO_DATE(x)",
@@ -730,6 +747,7 @@ class TestDialect(Validator):
                 "duckdb": "TO_TIMESTAMP(x)",
                 "hive": "FROM_UNIXTIME(x)",
                 "oracle": "TO_DATE('1970-01-01', 'YYYY-MM-DD') + (x / 86400)",
+                "materialize": "TO_TIMESTAMP(x)",
                 "postgres": "TO_TIMESTAMP(x)",
                 "presto": "FROM_UNIXTIME(x)",
                 "starrocks": "FROM_UNIXTIME(x)",
@@ -790,6 +808,7 @@ class TestDialect(Validator):
                 "drill": "DATE_ADD(x, INTERVAL 1 DAY)",
                 "duckdb": "x + INTERVAL 1 DAY",
                 "hive": "DATE_ADD(x, 1)",
+                "materialize": "x + INTERVAL '1 DAY'",
                 "mysql": "DATE_ADD(x, INTERVAL 1 DAY)",
                 "postgres": "x + INTERVAL '1 DAY'",
                 "presto": "DATE_ADD('DAY', 1, x)",
@@ -826,6 +845,7 @@ class TestDialect(Validator):
                 "duckdb": "DATE_TRUNC('DAY', x)",
                 "mysql": "DATE(x)",
                 "presto": "DATE_TRUNC('DAY', x)",
+                "materialize": "DATE_TRUNC('DAY', x)",
                 "postgres": "DATE_TRUNC('DAY', x)",
                 "snowflake": "DATE_TRUNC('DAY', x)",
                 "starrocks": "DATE_TRUNC('DAY', x)",
@@ -838,6 +858,7 @@ class TestDialect(Validator):
             read={
                 "bigquery": "TIMESTAMP_TRUNC(x, day)",
                 "duckdb": "DATE_TRUNC('day', x)",
+                "materialize": "DATE_TRUNC('day', x)",
                 "presto": "DATE_TRUNC('day', x)",
                 "postgres": "DATE_TRUNC('day', x)",
                 "snowflake": "DATE_TRUNC('day', x)",
@@ -899,6 +920,7 @@ class TestDialect(Validator):
             },
             write={
                 "bigquery": "DATE_TRUNC(x, YEAR)",
+                "materialize": "DATE_TRUNC('YEAR', x)",
                 "mysql": "STR_TO_DATE(CONCAT(YEAR(x), ' 1 1'), '%Y %c %e')",
                 "postgres": "DATE_TRUNC('YEAR', x)",
                 "snowflake": "DATE_TRUNC('YEAR', x)",
@@ -911,6 +933,7 @@ class TestDialect(Validator):
             "TIMESTAMP_TRUNC(x, YEAR)",
             read={
                 "bigquery": "TIMESTAMP_TRUNC(x, year)",
+                "materialize": "DATE_TRUNC('YEAR', x)",
                 "postgres": "DATE_TRUNC(year, x)",
                 "spark": "DATE_TRUNC('year', x)",
                 "snowflake": "DATE_TRUNC(year, x)",
@@ -1019,6 +1042,20 @@ class TestDialect(Validator):
             },
         )
 
+        self.validate_all(
+            "TIMESTAMP_TRUNC(x, DAY, 'UTC')",
+            write={
+                "": "TIMESTAMP_TRUNC(x, DAY, 'UTC')",
+                "duckdb": "DATE_TRUNC('DAY', x)",
+                "materialize": "DATE_TRUNC('DAY', x, 'UTC')",
+                "presto": "DATE_TRUNC('DAY', x)",
+                "postgres": "DATE_TRUNC('DAY', x, 'UTC')",
+                "snowflake": "DATE_TRUNC('DAY', x)",
+                "databricks": "DATE_TRUNC('DAY', x)",
+                "clickhouse": "DATE_TRUNC('DAY', x, 'UTC')",
+            },
+        )
+
         for unit in ("DAY", "MONTH", "YEAR"):
             self.validate_all(
                 f"{unit}(x)",
@@ -1119,7 +1156,6 @@ class TestDialect(Validator):
             write={
                 "bigquery": "SELECT fname, lname, age FROM person ORDER BY age DESC NULLS FIRST, fname ASC NULLS LAST, lname",
                 "duckdb": "SELECT fname, lname, age FROM person ORDER BY age DESC NULLS FIRST, fname ASC, lname NULLS FIRST",
-                "oracle": "SELECT fname, lname, age FROM person ORDER BY age DESC NULLS FIRST, fname ASC NULLS LAST, lname",
                 "presto": "SELECT fname, lname, age FROM person ORDER BY age DESC NULLS FIRST, fname ASC, lname NULLS FIRST",
                 "hive": "SELECT fname, lname, age FROM person ORDER BY age DESC NULLS FIRST, fname ASC NULLS LAST, lname",
                 "spark": "SELECT fname, lname, age FROM person ORDER BY age DESC NULLS FIRST, fname ASC NULLS LAST, lname",
@@ -1150,7 +1186,7 @@ class TestDialect(Validator):
             read={
                 "bigquery": "JSON_EXTRACT(x, '$.y')",
                 "duckdb": "x -> 'y'",
-                "doris": "x -> '$.y'",
+                "doris": "JSON_EXTRACT(x, '$.y')",
                 "mysql": "JSON_EXTRACT(x, '$.y')",
                 "postgres": "x->'y'",
                 "presto": "JSON_EXTRACT(x, '$.y')",
@@ -1161,7 +1197,7 @@ class TestDialect(Validator):
             write={
                 "bigquery": "JSON_EXTRACT(x, '$.y')",
                 "clickhouse": "JSONExtractString(x, 'y')",
-                "doris": "x -> '$.y'",
+                "doris": "JSON_EXTRACT(x, '$.y')",
                 "duckdb": "x -> '$.y'",
                 "mysql": "JSON_EXTRACT(x, '$.y')",
                 "oracle": "JSON_EXTRACT(x, '$.y')",
@@ -1205,7 +1241,7 @@ class TestDialect(Validator):
             read={
                 "bigquery": "JSON_EXTRACT(x, '$.y[0].z')",
                 "duckdb": "x -> '$.y[0].z'",
-                "doris": "x -> '$.y[0].z'",
+                "doris": "JSON_EXTRACT(x, '$.y[0].z')",
                 "mysql": "JSON_EXTRACT(x, '$.y[0].z')",
                 "presto": "JSON_EXTRACT(x, '$.y[0].z')",
                 "snowflake": "GET_PATH(x, 'y[0].z')",
@@ -1215,7 +1251,7 @@ class TestDialect(Validator):
             write={
                 "bigquery": "JSON_EXTRACT(x, '$.y[0].z')",
                 "clickhouse": "JSONExtractString(x, 'y', 1, 'z')",
-                "doris": "x -> '$.y[0].z'",
+                "doris": "JSON_EXTRACT(x, '$.y[0].z')",
                 "duckdb": "x -> '$.y[0].z'",
                 "mysql": "JSON_EXTRACT(x, '$.y[0].z')",
                 "oracle": "JSON_EXTRACT(x, '$.y[0].z')",
@@ -1472,21 +1508,21 @@ class TestDialect(Validator):
                 "snowflake": "x ILIKE '%y'",
             },
             write={
-                "bigquery": "LOWER(x) LIKE '%y'",
+                "bigquery": "LOWER(x) LIKE LOWER('%y')",
                 "clickhouse": "x ILIKE '%y'",
                 "drill": "x `ILIKE` '%y'",
                 "duckdb": "x ILIKE '%y'",
-                "hive": "LOWER(x) LIKE '%y'",
-                "mysql": "LOWER(x) LIKE '%y'",
-                "oracle": "LOWER(x) LIKE '%y'",
+                "hive": "LOWER(x) LIKE LOWER('%y')",
+                "mysql": "LOWER(x) LIKE LOWER('%y')",
+                "oracle": "LOWER(x) LIKE LOWER('%y')",
                 "postgres": "x ILIKE '%y'",
-                "presto": "LOWER(x) LIKE '%y'",
+                "presto": "LOWER(x) LIKE LOWER('%y')",
                 "snowflake": "x ILIKE '%y'",
                 "spark": "x ILIKE '%y'",
-                "sqlite": "LOWER(x) LIKE '%y'",
-                "starrocks": "LOWER(x) LIKE '%y'",
-                "trino": "LOWER(x) LIKE '%y'",
-                "doris": "LOWER(x) LIKE '%y'",
+                "sqlite": "LOWER(x) LIKE LOWER('%y')",
+                "starrocks": "LOWER(x) LIKE LOWER('%y')",
+                "trino": "LOWER(x) LIKE LOWER('%y')",
+                "doris": "LOWER(x) LIKE LOWER('%y')",
             },
         )
         self.validate_all(
@@ -1679,6 +1715,26 @@ class TestDialect(Validator):
                 "teradata": "CAST(a AS DOUBLE PRECISION) / b",
                 "trino": "CAST(a AS DOUBLE) / b",
                 "tsql": "CAST(a AS FLOAT) / b",
+            },
+        )
+        self.validate_all(
+            "MOD(8 - 1 + 7, 7)",
+            write={
+                "": "(8 - 1 + 7) % 7",
+                "hive": "(8 - 1 + 7) % 7",
+                "presto": "(8 - 1 + 7) % 7",
+                "snowflake": "(8 - 1 + 7) % 7",
+                "bigquery": "MOD(8 - 1 + 7, 7)",
+            },
+        )
+        self.validate_all(
+            "MOD(a, b + 1)",
+            write={
+                "": "a % (b + 1)",
+                "hive": "a % (b + 1)",
+                "presto": "a % (b + 1)",
+                "snowflake": "a % (b + 1)",
+                "bigquery": "MOD(a, b + 1)",
             },
         )
 
@@ -2186,6 +2242,8 @@ SELECT
         )
 
     def test_cast_to_user_defined_type(self):
+        self.validate_identity("CAST(x AS some_udt(1234))")
+
         self.validate_all(
             "CAST(x AS some_udt)",
             write={
@@ -2212,6 +2270,18 @@ SELECT
                 "oracle": "SELECT * FROM (SELECT *, COUNT(*) OVER () AS _w FROM t) _t WHERE _w > 1",
                 "postgres": "SELECT * FROM (SELECT *, COUNT(*) OVER () AS _w FROM t) AS _t WHERE _w > 1",
                 "tsql": "SELECT * FROM (SELECT *, COUNT(*) OVER () AS _w FROM t) AS _t WHERE _w > 1",
+            },
+        )
+        self.validate_all(
+            'SELECT "user id", some_id, 1 as other_id, 2 as "2 nd id" FROM t QUALIFY COUNT(*) OVER () > 1',
+            write={
+                "duckdb": 'SELECT "user id", some_id, 1 AS other_id, 2 AS "2 nd id" FROM t QUALIFY COUNT(*) OVER () > 1',
+                "snowflake": 'SELECT "user id", some_id, 1 AS other_id, 2 AS "2 nd id" FROM t QUALIFY COUNT(*) OVER () > 1',
+                "clickhouse": 'SELECT "user id", some_id, other_id, "2 nd id" FROM (SELECT "user id", some_id, 1 AS other_id, 2 AS "2 nd id", COUNT(*) OVER () AS _w FROM t) AS _t WHERE _w > 1',
+                "mysql": "SELECT `user id`, some_id, other_id, `2 nd id` FROM (SELECT `user id`, some_id, 1 AS other_id, 2 AS `2 nd id`, COUNT(*) OVER () AS _w FROM t) AS _t WHERE _w > 1",
+                "oracle": 'SELECT "user id", some_id, other_id, "2 nd id" FROM (SELECT "user id", some_id, 1 AS other_id, 2 AS "2 nd id", COUNT(*) OVER () AS _w FROM t) _t WHERE _w > 1',
+                "postgres": 'SELECT "user id", some_id, other_id, "2 nd id" FROM (SELECT "user id", some_id, 1 AS other_id, 2 AS "2 nd id", COUNT(*) OVER () AS _w FROM t) AS _t WHERE _w > 1',
+                "tsql": "SELECT [user id], some_id, other_id, [2 nd id] FROM (SELECT [user id] AS [user id], some_id AS some_id, 1 AS other_id, 2 AS [2 nd id], COUNT(*) OVER () AS _w FROM t) AS _t WHERE _w > 1",
             },
         )
 
@@ -2249,7 +2319,7 @@ SELECT
             "WITH t1(x) AS (SELECT 1) SELECT * FROM (WITH t2(y) AS (SELECT 2) SELECT y FROM t2) AS subq",
             write={
                 "duckdb": "WITH t1(x) AS (SELECT 1) SELECT * FROM (WITH t2(y) AS (SELECT 2) SELECT y FROM t2) AS subq",
-                "tsql": "WITH t2(y) AS (SELECT 2), t1(x) AS (SELECT 1) SELECT * FROM (SELECT y AS y FROM t2) AS subq",
+                "tsql": "WITH t1(x) AS (SELECT 1), t2(y) AS (SELECT 2) SELECT * FROM (SELECT y AS y FROM t2) AS subq",
             },
         )
         self.validate_all(
@@ -2272,6 +2342,59 @@ FROM c""",
                 "duckdb": "WITH c AS (WITH b AS (WITH a1 AS (SELECT 1), a2 AS (SELECT 2) SELECT * FROM a1, a2) SELECT * FROM b) SELECT * FROM c",
                 "hive": "WITH a1 AS (SELECT 1), a2 AS (SELECT 2), b AS (SELECT * FROM a1, a2), c AS (SELECT * FROM b) SELECT * FROM c",
             },
+        )
+        self.validate_all(
+            """
+WITH subquery1 AS (
+  WITH tmp AS (
+    SELECT
+      *
+    FROM table0
+  )
+  SELECT
+    *
+  FROM tmp
+), subquery2 AS (
+  WITH tmp2 AS (
+    SELECT
+      *
+    FROM table1
+    WHERE
+      a IN subquery1
+  )
+  SELECT
+    *
+  FROM tmp2
+)
+SELECT
+  *
+FROM subquery2
+""",
+            write={
+                "hive": """WITH tmp AS (
+  SELECT
+    *
+  FROM table0
+), subquery1 AS (
+  SELECT
+    *
+  FROM tmp
+), tmp2 AS (
+  SELECT
+    *
+  FROM table1
+  WHERE
+    a IN subquery1
+), subquery2 AS (
+  SELECT
+    *
+  FROM tmp2
+)
+SELECT
+  *
+FROM subquery2""",
+            },
+            pretty=True,
         )
 
     def test_unsupported_null_ordering(self):
@@ -2372,7 +2495,7 @@ FROM c""",
                 "hive": UnsupportedError,
                 "mysql": UnsupportedError,
                 "oracle": UnsupportedError,
-                "postgres": "(ARRAY_LENGTH(arr, 1) = 0 OR ARRAY_LENGTH(ARRAY(SELECT x FROM UNNEST(arr) AS _t(x) WHERE pred), 1) <> 0)",
+                "postgres": "(ARRAY_LENGTH(arr, 1) = 0 OR ARRAY_LENGTH(ARRAY(SELECT x FROM UNNEST(arr) AS _t0(x) WHERE pred), 1) <> 0)",
                 "presto": "ANY_MATCH(arr, x -> pred)",
                 "redshift": UnsupportedError,
                 "snowflake": UnsupportedError,
@@ -2430,7 +2553,7 @@ FROM c""",
     def test_reserved_keywords(self):
         order = exp.select("*").from_("order")
 
-        for dialect in ("presto", "redshift"):
+        for dialect in ("duckdb", "presto", "redshift"):
             dialect = Dialect.get_or_raise(dialect)
             self.assertEqual(
                 order.sql(dialect=dialect),

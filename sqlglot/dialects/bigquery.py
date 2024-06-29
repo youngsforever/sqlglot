@@ -22,6 +22,7 @@ from sqlglot.dialects.dialect import (
     build_date_delta_with_interval,
     regexp_replace_sql,
     rename_func,
+    sha256_sql,
     timestrtotime_sql,
     ts_or_ds_add_cast,
     unit_to_var,
@@ -156,7 +157,7 @@ def _build_date(args: t.List) -> exp.Date | exp.DateFromParts:
 def _build_to_hex(args: t.List) -> exp.Hex | exp.MD5:
     # TO_HEX(MD5(..)) is common in BigQuery, so it's parsed into MD5 to simplify its transpilation
     arg = seq_get(args, 0)
-    return exp.MD5(this=arg.this) if isinstance(arg, exp.MD5Digest) else exp.Hex(this=arg)
+    return exp.MD5(this=arg.this) if isinstance(arg, exp.MD5Digest) else exp.LowerHex(this=arg)
 
 
 def _array_contains_sql(self: BigQuery.Generator, expression: exp.ArrayContains) -> str:
@@ -200,10 +201,35 @@ def _unix_to_time_sql(self: BigQuery.Generator, expression: exp.UnixToTime) -> s
 def _build_time(args: t.List) -> exp.Func:
     if len(args) == 1:
         return exp.TsOrDsToTime(this=args[0])
-    if len(args) == 3:
-        return exp.TimeFromParts.from_arg_list(args)
+    if len(args) == 2:
+        return exp.Time.from_arg_list(args)
+    return exp.TimeFromParts.from_arg_list(args)
 
-    return exp.Anonymous(this="TIME", expressions=args)
+
+def _build_datetime(args: t.List) -> exp.Func:
+    if len(args) == 1:
+        return exp.TsOrDsToTimestamp.from_arg_list(args)
+    if len(args) == 2:
+        return exp.Datetime.from_arg_list(args)
+    return exp.TimestampFromParts.from_arg_list(args)
+
+
+def _str_to_datetime_sql(
+    self: BigQuery.Generator, expression: exp.StrToDate | exp.StrToTime
+) -> str:
+    this = self.sql(expression, "this")
+    dtype = "DATE" if isinstance(expression, exp.StrToDate) else "TIMESTAMP"
+
+    if expression.args.get("safe"):
+        fmt = self.format_time(
+            expression,
+            self.dialect.INVERSE_FORMAT_MAPPING,
+            self.dialect.INVERSE_FORMAT_TRIE,
+        )
+        return f"SAFE_CAST({this} AS {dtype} FORMAT {fmt})"
+
+    fmt = self.format_time(expression)
+    return self.func(f"PARSE_{dtype}", fmt, this, expression.args.get("zone"))
 
 
 class BigQuery(Dialect):
@@ -212,6 +238,9 @@ class BigQuery(Dialect):
     SUPPORTS_USER_DEFINED_TYPES = False
     SUPPORTS_SEMI_ANTI_JOIN = False
     LOG_BASE_FIRST = False
+    HEX_LOWERCASE = True
+    FORCE_EARLY_ALIAS_REF_EXPANSION = True
+    EXPAND_ALIAS_REFS_EARLY_ONLY_IN_GROUP_BY = True
 
     # https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#case_sensitivity
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE
@@ -246,7 +275,10 @@ class BigQuery(Dialect):
     PSEUDOCOLUMNS = {"_PARTITIONTIME", "_PARTITIONDATE"}
 
     def normalize_identifier(self, expression: E) -> E:
-        if isinstance(expression, exp.Identifier):
+        if (
+            isinstance(expression, exp.Identifier)
+            and self.normalization_strategy is not NormalizationStrategy.CASE_SENSITIVE
+        ):
             parent = expression.parent
             while isinstance(parent, exp.Dot):
                 parent = parent.parent
@@ -305,6 +337,7 @@ class BigQuery(Dialect):
         }
         KEYWORDS.pop("DIV")
         KEYWORDS.pop("VALUES")
+        KEYWORDS.pop("/*+")
 
     class Parser(parser.Parser):
         PREFIXED_PIVOT_COLUMNS = True
@@ -320,6 +353,7 @@ class BigQuery(Dialect):
                 unit=exp.Literal.string(str(seq_get(args, 1))),
                 this=seq_get(args, 0),
             ),
+            "DATETIME": _build_datetime,
             "DATETIME_ADD": build_date_delta_with_interval(exp.DatetimeAdd),
             "DATETIME_SUB": build_date_delta_with_interval(exp.DatetimeSub),
             "DIV": binary_from_function(exp.IntDiv),
@@ -330,6 +364,7 @@ class BigQuery(Dialect):
             "JSON_EXTRACT_SCALAR": lambda args: exp.JSONExtractScalar(
                 this=seq_get(args, 0), expression=seq_get(args, 1) or exp.Literal.string("$")
             ),
+            "LENGTH": lambda args: exp.Length(this=seq_get(args, 0), binary=True),
             "MD5": exp.MD5Digest.from_arg_list,
             "TO_HEX": _build_to_hex,
             "PARSE_DATE": lambda args: build_formatted_time(exp.StrToDate, "bigquery")(
@@ -548,7 +583,7 @@ class BigQuery(Dialect):
             return bracket
 
     class Generator(generator.Generator):
-        EXPLICIT_UNION = True
+        EXPLICIT_SET_OP = True
         INTERVAL_ALLOWS_PLURAL_FORM = False
         JOIN_HINTS = False
         QUERY_HINTS = False
@@ -568,6 +603,8 @@ class BigQuery(Dialect):
         CAN_IMPLEMENT_ARRAY_ANY = True
         SUPPORTS_TO_NUMBER = False
         NAMED_PLACEHOLDER_TOKEN = "@"
+        HEX_FUNC = "TO_HEX"
+        WITH_PROPERTIES_PREFIX = "OPTIONS"
 
         TRANSFORMS = {
             **generator.Generator.TRANSFORMS,
@@ -603,13 +640,12 @@ class BigQuery(Dialect):
             ),
             exp.GenerateSeries: rename_func("GENERATE_ARRAY"),
             exp.GroupConcat: rename_func("STRING_AGG"),
-            exp.Hex: rename_func("TO_HEX"),
+            exp.Hex: lambda self, e: self.func("UPPER", self.func("TO_HEX", self.sql(e, "this"))),
             exp.If: if_sql(false_value="NULL"),
             exp.ILike: no_ilike_sql,
             exp.IntDiv: rename_func("DIV"),
             exp.JSONFormat: rename_func("TO_JSON_STRING"),
             exp.Max: max_or_greatest,
-            exp.Mod: rename_func("MOD"),
             exp.MD5: lambda self, e: self.func("TO_HEX", self.func("MD5", e.this)),
             exp.MD5Digest: rename_func("MD5"),
             exp.Min: min_or_least,
@@ -634,18 +670,16 @@ class BigQuery(Dialect):
                     transforms.eliminate_semi_and_anti_joins,
                 ]
             ),
-            exp.SHA2: lambda self, e: self.func(
-                "SHA256" if e.text("length") == "256" else "SHA512", e.this
-            ),
+            exp.SHA: rename_func("SHA1"),
+            exp.SHA2: sha256_sql,
             exp.StabilityProperty: lambda self, e: (
                 "DETERMINISTIC" if e.name == "IMMUTABLE" else "NOT DETERMINISTIC"
             ),
-            exp.StrToDate: lambda self, e: self.func("PARSE_DATE", self.format_time(e), e.this),
-            exp.StrToTime: lambda self, e: self.func(
-                "PARSE_TIMESTAMP", self.format_time(e), e.this, e.args.get("zone")
-            ),
+            exp.StrToDate: _str_to_datetime_sql,
+            exp.StrToTime: _str_to_datetime_sql,
             exp.TimeAdd: date_add_interval_sql("TIME", "ADD"),
             exp.TimeFromParts: rename_func("TIME"),
+            exp.TimestampFromParts: rename_func("DATETIME"),
             exp.TimeSub: date_add_interval_sql("TIME", "SUB"),
             exp.TimestampAdd: date_add_interval_sql("TIMESTAMP", "ADD"),
             exp.TimestampDiff: rename_func("TIMESTAMP_DIFF"),
@@ -656,6 +690,7 @@ class BigQuery(Dialect):
             exp.TsOrDsAdd: _ts_or_ds_add_sql,
             exp.TsOrDsDiff: _ts_or_ds_diff_sql,
             exp.TsOrDsToTime: rename_func("TIME"),
+            exp.TsOrDsToTimestamp: rename_func("DATETIME"),
             exp.Unhex: rename_func("FROM_HEX"),
             exp.UnixDate: rename_func("UNIX_DATE"),
             exp.UnixToTime: _unix_to_time_sql,
@@ -702,7 +737,6 @@ class BigQuery(Dialect):
 
         # from: https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#reserved_keywords
         RESERVED_KEYWORDS = {
-            *generator.Generator.RESERVED_KEYWORDS,
             "all",
             "and",
             "any",
@@ -801,6 +835,15 @@ class BigQuery(Dialect):
             "within",
         }
 
+        def mod_sql(self, expression: exp.Mod) -> str:
+            this = expression.this
+            expr = expression.expression
+            return self.func(
+                "MOD",
+                this.unnest() if isinstance(this, exp.Paren) else this,
+                expr.unnest() if isinstance(expr, exp.Paren) else expr,
+            )
+
         def column_parts(self, expression: exp.Column) -> str:
             if expression.meta.get("quoted_column"):
                 # If a column reference is of the form `dataset.table`.name, we need
@@ -895,9 +938,6 @@ class BigQuery(Dialect):
             if not expression.args.get("distinct"):
                 self.unsupported("INTERSECT without DISTINCT is not supported in BigQuery")
             return f"INTERSECT{' DISTINCT' if expression.args.get('distinct') else ' ALL'}"
-
-        def with_properties(self, properties: exp.Properties) -> str:
-            return self.properties(properties, prefix=self.seg("OPTIONS"))
 
         def version_sql(self, expression: exp.Version) -> str:
             if expression.name == "TIMESTAMP":

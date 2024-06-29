@@ -14,6 +14,8 @@ class TestParser(unittest.TestCase):
             parse_one("")
 
     def test_parse_into(self):
+        self.assertIsInstance(parse_one("select * from t", into=exp.Select), exp.Select)
+        self.assertIsInstance(parse_one("select * from t limit 5", into=exp.Select), exp.Select)
         self.assertIsInstance(parse_one("left join foo", into=exp.Join), exp.Join)
         self.assertIsInstance(parse_one("int", into=exp.DataType), exp.DataType)
         self.assertIsInstance(parse_one("array<int>", into=exp.DataType), exp.DataType)
@@ -102,10 +104,18 @@ class TestParser(unittest.TestCase):
     def test_float(self):
         self.assertEqual(parse_one(".2"), parse_one("0.2"))
 
+    def test_unnest(self):
+        unnest_sql = "UNNEST(foo)"
+        expr = parse_one(unnest_sql)
+        self.assertIsInstance(expr, exp.Unnest)
+        self.assertIsInstance(expr.expressions, list)
+        self.assertEqual(expr.sql(), unnest_sql)
+
     def test_unnest_projection(self):
         expr = parse_one("SELECT foo IN UNNEST(bla) AS bar")
         self.assertIsInstance(expr.selects[0], exp.Alias)
         self.assertEqual(expr.selects[0].output_name, "bar")
+        self.assertIsNotNone(parse_one("select unnest(x)").find(exp.Unnest))
 
     def test_unary_plus(self):
         self.assertEqual(parse_one("+15"), exp.Literal.number(15))
@@ -503,7 +513,7 @@ class TestParser(unittest.TestCase):
 
         self.assertIsInstance(set_item, exp.SetItem)
         self.assertIsInstance(set_item.this, exp.EQ)
-        self.assertIsInstance(set_item.this.this, exp.Identifier)
+        self.assertIsInstance(set_item.this.this, exp.Column)
         self.assertIsInstance(set_item.this.expression, exp.Literal)
 
         self.assertEqual(set_item.args.get("kind"), "SESSION")
@@ -856,5 +866,40 @@ class TestParser(unittest.TestCase):
             with self.subTest(dialect):
                 self.assertEqual(parse_one(sql, dialect=dialect).sql(dialect=dialect), sql)
 
+    def test_alter_set(self):
+        sqls = [
+            "ALTER TABLE tbl SET TBLPROPERTIES ('x'='1', 'Z'='2')",
+            "ALTER TABLE tbl SET SERDE 'test' WITH SERDEPROPERTIES ('k'='v', 'kay'='vee')",
+            "ALTER TABLE tbl SET SERDEPROPERTIES ('k'='v', 'kay'='vee')",
+            "ALTER TABLE tbl SET LOCATION 'new_location'",
+            "ALTER TABLE tbl SET FILEFORMAT file_format",
+            "ALTER TABLE tbl SET TAGS ('tag1' = 't1', 'tag2' = 't2')",
+        ]
+
+        for dialect in (
+            "hive",
+            "spark2",
+            "spark",
+            "databricks",
+        ):
+            for sql in sqls:
+                with self.subTest(f"Testing query '{sql}' for dialect {dialect}"):
+                    self.assertEqual(parse_one(sql, dialect=dialect).sql(dialect=dialect), sql)
+
     def test_distinct_from(self):
         self.assertIsInstance(parse_one("a IS DISTINCT FROM b OR c IS DISTINCT FROM d"), exp.Or)
+
+    def test_trailing_comments(self):
+        expressions = parse(
+            """
+        select * from x;
+        -- my comment
+            """
+        )
+
+        self.assertEqual(
+            ";\n".join(e.sql() for e in expressions), "SELECT * FROM x;\n/* my comment */"
+        )
+
+    def test_parse_prop_eq(self):
+        self.assertIsInstance(parse_one("x(a := b and c)").expressions[0], exp.PropertyEQ)

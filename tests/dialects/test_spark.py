@@ -245,7 +245,7 @@ TBLPROPERTIES (
         self.validate_identity("SELECT TRANSFORM(ARRAY(1, 2, 3), x -> x + 1)")
         self.validate_identity("SELECT TRANSFORM(ARRAY(1, 2, 3), (x, i) -> x + i)")
         self.validate_identity("REFRESH TABLE a.b.c")
-        self.validate_identity("INTERVAL -86 DAYS")
+        self.validate_identity("INTERVAL '-86' DAYS")
         self.validate_identity("TRIM('    SparkSQL   ')")
         self.validate_identity("TRIM(BOTH 'SL' FROM 'SSparkSQLS')")
         self.validate_identity("TRIM(LEADING 'SL' FROM 'SSparkSQLS')")
@@ -325,7 +325,7 @@ TBLPROPERTIES (
             write={
                 "clickhouse": "WITH tbl AS (SELECT 1 AS id, 'eggy' AS name UNION ALL SELECT NULL AS id, 'jake' AS name) SELECT COUNT(DISTINCT id, name) AS cnt FROM tbl",
                 "databricks": "WITH tbl AS (SELECT 1 AS id, 'eggy' AS name UNION ALL SELECT NULL AS id, 'jake' AS name) SELECT COUNT(DISTINCT id, name) AS cnt FROM tbl",
-                "doris": "WITH tbl AS (SELECT 1 AS id, 'eggy' AS name UNION ALL SELECT NULL AS id, 'jake' AS name) SELECT COUNT(DISTINCT id, name) AS cnt FROM tbl",
+                "doris": "WITH tbl AS (SELECT 1 AS id, 'eggy' AS `name` UNION ALL SELECT NULL AS id, 'jake' AS `name`) SELECT COUNT(DISTINCT id, `name`) AS cnt FROM tbl",
                 "duckdb": "WITH tbl AS (SELECT 1 AS id, 'eggy' AS name UNION ALL SELECT NULL AS id, 'jake' AS name) SELECT COUNT(DISTINCT CASE WHEN id IS NULL THEN NULL WHEN name IS NULL THEN NULL ELSE (id, name) END) AS cnt FROM tbl",
                 "hive": "WITH tbl AS (SELECT 1 AS id, 'eggy' AS name UNION ALL SELECT NULL AS id, 'jake' AS name) SELECT COUNT(DISTINCT id, name) AS cnt FROM tbl",
                 "mysql": "WITH tbl AS (SELECT 1 AS id, 'eggy' AS name UNION ALL SELECT NULL AS id, 'jake' AS name) SELECT COUNT(DISTINCT id, name) AS cnt FROM tbl",
@@ -563,6 +563,7 @@ TBLPROPERTIES (
             "SELECT DATE_ADD(my_date_column, 1)",
             write={
                 "spark": "SELECT DATE_ADD(my_date_column, 1)",
+                "spark2": "SELECT DATE_ADD(my_date_column, 1)",
                 "bigquery": "SELECT DATE_ADD(CAST(CAST(my_date_column AS DATETIME) AS DATE), INTERVAL 1 DAY)",
             },
         )
@@ -673,6 +674,16 @@ TBLPROPERTIES (
                 "presto": "SELECT ARRAY_SORT(x)",
                 "hive": "SELECT SORT_ARRAY(x)",
                 "spark": "SELECT ARRAY_SORT(x)",
+            },
+        )
+        self.validate_all(
+            "SELECT DATE_ADD(MONTH, 20, col)",
+            read={
+                "spark": "SELECT TIMESTAMPADD(MONTH, 20, col)",
+            },
+            write={
+                "spark": "SELECT DATE_ADD(MONTH, 20, col)",
+                "databricks": "SELECT DATE_ADD(MONTH, 20, col)",
             },
         )
 

@@ -115,7 +115,7 @@ ARRAY(foo, time)
 ARRAY(LENGTH(waiter_name) > 0)
 ARRAY_CONTAINS(x, 1)
 x.EXTRACT(1)
-EXTRACT(x FROM y)
+EXTRACT(X FROM y)
 EXTRACT(DATE FROM y)
 EXTRACT(WEEK(monday) FROM created_at)
 CONCAT_WS('-', 'a', 'b')
@@ -733,6 +733,8 @@ SELECT (WITH x AS (SELECT 1 AS y) SELECT * FROM x) AS z
 SELECT ((SELECT 1) + 1)
 SELECT * FROM project.dataset.INFORMATION_SCHEMA.TABLES
 SELECT CAST(x AS INT) /* comment */ FROM foo
+SELECT c /* c1 /* c2 */ c3 */
+SELECT c /* c1 /* c2 /* c3 */ */ */
 SELECT c /* c1 */ AS alias /* c2 */
 SELECT a /* x */, b /* x */
 SELECT a /* x */ /* y */ /* z */, b /* k */ /* m */
@@ -870,3 +872,7 @@ SELECT enum
 SELECT unlogged
 SELECT name
 SELECT copy
+SELECT rollup
+SELECT unnest
+SELECT * FROM a STRAIGHT_JOIN b
+SELECT COUNT(DISTINCT "foo bar") FROM (SELECT 1 AS "foo bar") AS t

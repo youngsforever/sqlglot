@@ -13,6 +13,7 @@ from sqlglot.dialects.dialect import (
     trim_sql,
 )
 from sqlglot.helper import seq_get
+from sqlglot.parser import OPTIONS_TYPE
 from sqlglot.tokens import TokenType
 
 if t.TYPE_CHECKING:
@@ -36,6 +37,7 @@ class Oracle(Dialect):
     ALIAS_POST_TABLESAMPLE = True
     LOCKING_READS_SUPPORTED = True
     TABLESAMPLE_SIZE_IS_PERCENT = True
+    NULL_ORDERING = "nulls_are_large"
 
     # See section 8: https://docs.oracle.com/cd/A97630_01/server.920/a96540/sql_elements9a.htm
     NORMALIZATION_STRATEGY = NormalizationStrategy.UPPERCASE
@@ -69,6 +71,12 @@ class Oracle(Dialect):
 
     class Tokenizer(tokens.Tokenizer):
         VAR_SINGLE_TOKENS = {"@", "$", "#"}
+
+        UNICODE_STRINGS = [
+            (prefix + q, q)
+            for q in t.cast(t.List[str], tokens.Tokenizer.QUOTES)
+            for prefix in ("U", "u")
+        ]
 
         KEYWORDS = {
             **tokens.Tokenizer.KEYWORDS,
@@ -114,13 +122,6 @@ class Oracle(Dialect):
             "XMLTABLE": lambda self: self._parse_xml_table(),
         }
 
-        NO_PAREN_FUNCTION_PARSERS = {
-            **parser.Parser.NO_PAREN_FUNCTION_PARSERS,
-            "CONNECT_BY_ROOT": lambda self: self.expression(
-                exp.ConnectByRoot, this=self._parse_column()
-            ),
-        }
-
         PROPERTY_PARSERS = {
             **parser.Parser.PROPERTY_PARSERS,
             "GLOBAL": lambda self: self._match_text_seq("TEMPORARY")
@@ -132,6 +133,7 @@ class Oracle(Dialect):
         QUERY_MODIFIER_PARSERS = {
             **parser.Parser.QUERY_MODIFIER_PARSERS,
             TokenType.ORDER_SIBLINGS_BY: lambda self: ("order", self._parse_order()),
+            TokenType.WITH: lambda self: ("options", [self._parse_query_restrictions()]),
         }
 
         TYPE_LITERAL_PARSERS = {
@@ -143,6 +145,13 @@ class Oracle(Dialect):
         # SELECT UNIQUE .. is old-style Oracle syntax for SELECT DISTINCT ..
         # Reference: https://stackoverflow.com/a/336455
         DISTINCT_TOKENS = {TokenType.DISTINCT, TokenType.UNIQUE}
+
+        QUERY_RESTRICTIONS: OPTIONS_TYPE = {
+            "WITH": (
+                ("READ", "ONLY"),
+                ("CHECK", "OPTION"),
+            ),
+        }
 
         def _parse_xml_table(self) -> exp.XMLTable:
             this = self._parse_string()
@@ -173,12 +182,6 @@ class Oracle(Dialect):
                 **kwargs,
             )
 
-        def _parse_column(self) -> t.Optional[exp.Expression]:
-            column = super()._parse_column()
-            if column:
-                column.set("join_mark", self._match(TokenType.JOIN_MARKER))
-            return column
-
         def _parse_hint(self) -> t.Optional[exp.Hint]:
             if self._match(TokenType.HINT):
                 start = self._curr
@@ -193,11 +196,22 @@ class Oracle(Dialect):
 
             return None
 
+        def _parse_query_restrictions(self) -> t.Optional[exp.Expression]:
+            kind = self._parse_var_from_options(self.QUERY_RESTRICTIONS, raise_unmatched=False)
+
+            if not kind:
+                return None
+
+            return self.expression(
+                exp.QueryOption,
+                this=kind,
+                expression=self._match(TokenType.CONSTRAINT) and self._parse_field(),
+            )
+
     class Generator(generator.Generator):
         LOCKING_READS_SUPPORTED = True
         JOIN_HINTS = False
         TABLE_HINTS = False
-        COLUMN_JOIN_MARKS_SUPPORTED = True
         DATA_TYPE_SPECIFIERS_ALLOWED = True
         ALTER_TABLE_INCLUDE_COLUMN_KEYWORD = False
         LIMIT_FETCH = "FETCH"
@@ -227,7 +241,6 @@ class Oracle(Dialect):
 
         TRANSFORMS = {
             **generator.Generator.TRANSFORMS,
-            exp.ConnectByRoot: lambda self, e: f"CONNECT_BY_ROOT {self.sql(e, 'this')}",
             exp.DateStrToDate: lambda self, e: self.func(
                 "TO_DATE", e.this, exp.Literal.string("YYYY-MM-DD")
             ),
@@ -282,3 +295,10 @@ class Oracle(Dialect):
             if len(expression.args.get("actions", [])) > 1:
                 return f"ADD ({actions})"
             return f"ADD {actions}"
+
+        def queryoption_sql(self, expression: exp.QueryOption) -> str:
+            option = self.sql(expression, "this")
+            value = self.sql(expression, "expression")
+            value = f" CONSTRAINT {value}" if value else ""
+
+            return f"{option}{value}"

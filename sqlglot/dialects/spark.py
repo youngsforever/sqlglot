@@ -33,12 +33,27 @@ def _build_datediff(args: t.List) -> exp.Expression:
     expression = seq_get(args, 1)
 
     if len(args) == 3:
-        unit = this
+        unit = exp.var(t.cast(exp.Expression, this).name)
         this = args[2]
 
     return exp.DateDiff(
         this=exp.TsOrDsToDate(this=this), expression=exp.TsOrDsToDate(this=expression), unit=unit
     )
+
+
+def _build_dateadd(args: t.List) -> exp.Expression:
+    expression = seq_get(args, 1)
+
+    if len(args) == 2:
+        # DATE_ADD(startDate, numDays INTEGER)
+        # https://docs.databricks.com/en/sql/language-manual/functions/date_add.html
+        return exp.TsOrDsAdd(
+            this=seq_get(args, 0), expression=expression, unit=exp.Literal.string("DAY")
+        )
+
+    # DATE_ADD / DATEADD / TIMESTAMPADD(unit, value integer, expr)
+    # https://docs.databricks.com/en/sql/language-manual/functions/date_add3.html
+    return exp.TimestampAdd(this=seq_get(args, 2), expression=expression, unit=seq_get(args, 0))
 
 
 def _normalize_partition(e: exp.Expression) -> exp.Expression:
@@ -50,8 +65,34 @@ def _normalize_partition(e: exp.Expression) -> exp.Expression:
     return e
 
 
+def _dateadd_sql(self: Spark.Generator, expression: exp.TsOrDsAdd | exp.TimestampAdd) -> str:
+    if not expression.unit or (
+        isinstance(expression, exp.TsOrDsAdd) and expression.text("unit").upper() == "DAY"
+    ):
+        # Coming from Hive/Spark2 DATE_ADD or roundtripping the 2-arg version of Spark3/DB
+        return self.func("DATE_ADD", expression.this, expression.expression)
+
+    this = self.func(
+        "DATE_ADD",
+        unit_to_var(expression),
+        expression.expression,
+        expression.this,
+    )
+
+    if isinstance(expression, exp.TsOrDsAdd):
+        # The 3 arg version of DATE_ADD produces a timestamp in Spark3/DB but possibly not
+        # in other dialects
+        return_type = expression.return_type
+        if not return_type.is_type(exp.DataType.Type.TIMESTAMP, exp.DataType.Type.DATETIME):
+            this = f"CAST({this} AS {return_type})"
+
+    return this
+
+
 class Spark(Spark2):
     class Tokenizer(Spark2.Tokenizer):
+        STRING_ESCAPES_ALLOWED_IN_RAW_STRINGS = False
+
         RAW_STRINGS = [
             (prefix + q, q)
             for q in t.cast(t.List[str], Spark2.Tokenizer.QUOTES)
@@ -62,7 +103,11 @@ class Spark(Spark2):
         FUNCTIONS = {
             **Spark2.Parser.FUNCTIONS,
             "ANY_VALUE": _build_with_ignore_nulls(exp.AnyValue),
+            "DATE_ADD": _build_dateadd,
+            "DATEADD": _build_dateadd,
+            "TIMESTAMPADD": _build_dateadd,
             "DATEDIFF": _build_datediff,
+            "DATE_DIFF": _build_datediff,
             "TIMESTAMP_LTZ": _build_as_cast("TIMESTAMP_LTZ"),
             "TIMESTAMP_NTZ": _build_as_cast("TIMESTAMP_NTZ"),
             "TRY_ELEMENT_AT": lambda args: exp.Bracket(
@@ -96,6 +141,9 @@ class Spark(Spark2):
 
         TRANSFORMS = {
             **Spark2.Generator.TRANSFORMS,
+            exp.ArrayConstructCompact: lambda self, e: self.func(
+                "ARRAY_COMPACT", self.func("ARRAY", *e.expressions)
+            ),
             exp.Create: preprocess(
                 [
                     remove_unique_constraints,
@@ -108,9 +156,8 @@ class Spark(Spark2):
             exp.PartitionedByProperty: lambda self,
             e: f"PARTITIONED BY {self.wrap(self.expressions(sqls=[_normalize_partition(e) for e in e.this.expressions], skip_first=True))}",
             exp.StartsWith: rename_func("STARTSWITH"),
-            exp.TimestampAdd: lambda self, e: self.func(
-                "DATEADD", unit_to_var(e), e.expression, e.this
-            ),
+            exp.TsOrDsAdd: _dateadd_sql,
+            exp.TimestampAdd: _dateadd_sql,
             exp.TryCast: lambda self, e: (
                 self.trycast_sql(e) if e.args.get("safe") else self.cast_sql(e)
             ),

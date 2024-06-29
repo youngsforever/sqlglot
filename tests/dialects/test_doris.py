@@ -14,7 +14,9 @@ class TestDoris(Validator):
         )
         self.validate_all(
             "SELECT MAX_BY(a, b), MIN_BY(c, d)",
-            read={"clickhouse": "SELECT argMax(a, b), argMin(c, d)"},
+            read={
+                "clickhouse": "SELECT argMax(a, b), argMin(c, d)",
+            },
         )
         self.validate_all(
             "SELECT ARRAY_SUM(x -> x * x, ARRAY(2, 3))",
@@ -34,6 +36,52 @@ class TestDoris(Validator):
             write={
                 "doris": "MONTHS_ADD(d, n)",
                 "oracle": "ADD_MONTHS(d, n)",
+            },
+        )
+        self.validate_all(
+            """SELECT JSON_EXTRACT(CAST('{"key": 1}' AS JSONB), '$.key')""",
+            read={
+                "postgres": """SELECT '{"key": 1}'::jsonb ->> 'key'""",
+            },
+            write={
+                "doris": """SELECT JSON_EXTRACT(CAST('{"key": 1}' AS JSONB), '$.key')""",
+                "postgres": """SELECT JSON_EXTRACT_PATH(CAST('{"key": 1}' AS JSONB), 'key')""",
+            },
+        )
+        self.validate_all(
+            "SELECT GROUP_CONCAT('aa', ',')",
+            read={
+                "doris": "SELECT GROUP_CONCAT('aa', ',')",
+                "mysql": "SELECT GROUP_CONCAT('aa' SEPARATOR ',')",
+                "postgres": "SELECT STRING_AGG('aa', ',')",
+            },
+        )
+        self.validate_all(
+            "SELECT LAG(1, 1, NULL) OVER (ORDER BY 1)",
+            read={
+                "doris": "SELECT LAG(1, 1, NULL) OVER (ORDER BY 1)",
+                "postgres": "SELECT LAG(1) OVER (ORDER BY 1)",
+            },
+        )
+        self.validate_all(
+            "SELECT LAG(1, 2, NULL) OVER (ORDER BY 1)",
+            read={
+                "doris": "SELECT LAG(1, 2, NULL) OVER (ORDER BY 1)",
+                "postgres": "SELECT LAG(1, 2) OVER (ORDER BY 1)",
+            },
+        )
+        self.validate_all(
+            "SELECT LEAD(1, 1, NULL) OVER (ORDER BY 1)",
+            read={
+                "doris": "SELECT LEAD(1, 1, NULL) OVER (ORDER BY 1)",
+                "postgres": "SELECT LEAD(1) OVER (ORDER BY 1)",
+            },
+        )
+        self.validate_all(
+            "SELECT LEAD(1, 2, NULL) OVER (ORDER BY 1)",
+            read={
+                "doris": "SELECT LEAD(1, 2, NULL) OVER (ORDER BY 1)",
+                "postgres": "SELECT LEAD(1, 2) OVER (ORDER BY 1)",
             },
         )
 

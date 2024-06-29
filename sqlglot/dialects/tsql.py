@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import re
 import typing as t
+from functools import partial
 
 from sqlglot import exp, generator, parser, tokens, transforms
 from sqlglot.dialects.dialect import (
@@ -16,7 +17,6 @@ from sqlglot.dialects.dialect import (
     min_or_least,
     build_date_delta,
     rename_func,
-    timestrtotime_sql,
     trim_sql,
 )
 from sqlglot.helper import seq_get
@@ -211,7 +211,8 @@ def _string_agg_sql(self: TSQL.Generator, expression: exp.GroupConcat) -> str:
     if isinstance(expression.this, exp.Order):
         if expression.this.this:
             this = expression.this.this.pop()
-        order = f" WITHIN GROUP ({self.sql(expression.this)[1:]})"  # Order has a leading space
+        # Order has a leading space
+        order = f" WITHIN GROUP ({self.sql(expression.this)[1:]})"
 
     separator = expression.args.get("separator") or exp.Literal.string(",")
     return f"STRING_AGG({self.format_args(this, separator)}){order}"
@@ -449,13 +450,18 @@ class TSQL(Dialect):
 
         KEYWORDS = {
             **tokens.Tokenizer.KEYWORDS,
+            "CLUSTERED INDEX": TokenType.INDEX,
             "DATETIME2": TokenType.DATETIME,
             "DATETIMEOFFSET": TokenType.TIMESTAMPTZ,
-            "DECLARE": TokenType.COMMAND,
+            "DECLARE": TokenType.DECLARE,
             "EXEC": TokenType.COMMAND,
+            "FOR SYSTEM_TIME": TokenType.TIMESTAMP_SNAPSHOT,
             "IMAGE": TokenType.IMAGE,
             "MONEY": TokenType.MONEY,
+            "NONCLUSTERED INDEX": TokenType.INDEX,
             "NTEXT": TokenType.TEXT,
+            "OPTION": TokenType.OPTION,
+            "OUTPUT": TokenType.RETURNING,
             "PRINT": TokenType.COMMAND,
             "PROC": TokenType.PROCEDURE,
             "REAL": TokenType.FLOAT,
@@ -463,16 +469,17 @@ class TSQL(Dialect):
             "SMALLDATETIME": TokenType.DATETIME,
             "SMALLMONEY": TokenType.SMALLMONEY,
             "SQL_VARIANT": TokenType.VARIANT,
+            "SYSTEM_USER": TokenType.CURRENT_USER,
             "TOP": TokenType.TOP,
             "TIMESTAMP": TokenType.ROWVERSION,
+            "TINYINT": TokenType.UTINYINT,
             "UNIQUEIDENTIFIER": TokenType.UNIQUEIDENTIFIER,
             "UPDATE STATISTICS": TokenType.COMMAND,
             "XML": TokenType.XML,
-            "OUTPUT": TokenType.RETURNING,
-            "SYSTEM_USER": TokenType.CURRENT_USER,
-            "FOR SYSTEM_TIME": TokenType.TIMESTAMP_SNAPSHOT,
-            "OPTION": TokenType.OPTION,
         }
+        KEYWORDS.pop("/*+")
+
+        COMMANDS = {*tokens.Tokenizer.COMMANDS, TokenType.END}
 
     class Parser(parser.Parser):
         SET_REQUIRES_ASSIGNMENT_DELIMITER = False
@@ -526,8 +533,28 @@ class TSQL(Dialect):
 
         STATEMENT_PARSERS = {
             **parser.Parser.STATEMENT_PARSERS,
-            TokenType.END: lambda self: self._parse_command(),
+            TokenType.DECLARE: lambda self: self._parse_declare(),
         }
+
+        RANGE_PARSERS = {
+            **parser.Parser.RANGE_PARSERS,
+            TokenType.DCOLON: lambda self, this: self.expression(
+                exp.ScopeResolution,
+                this=this,
+                expression=self._parse_function() or self._parse_var(any_token=True),
+            ),
+        }
+
+        # The DCOLON (::) operator serves as a scope resolution (exp.ScopeResolution) operator in T-SQL
+        COLUMN_OPERATORS = {
+            **parser.Parser.COLUMN_OPERATORS,
+            TokenType.DCOLON: lambda self, this, to: self.expression(exp.Cast, this=this, to=to)
+            if isinstance(to, exp.DataType) and to.this != exp.DataType.Type.USERDEFINED
+            else self.expression(exp.ScopeResolution, this=this, expression=to),
+        }
+
+        def _parse_dcolon(self) -> t.Optional[exp.Expression]:
+            return self._parse_function() or self._parse_types()
 
         def _parse_options(self) -> t.Optional[t.List[exp.Expression]]:
             if not self._match(TokenType.OPTION):
@@ -621,7 +648,7 @@ class TSQL(Dialect):
         ) -> t.Optional[exp.Expression]:
             this = self._parse_types()
             self._match(TokenType.COMMA)
-            args = [this, *self._parse_csv(self._parse_conjunction)]
+            args = [this, *self._parse_csv(self._parse_assignment)]
             convert = exp.Convert.from_arg_list(args)
             convert.set("safe", safe)
             convert.set("strict", strict)
@@ -711,6 +738,32 @@ class TSQL(Dialect):
 
             return partition
 
+        def _parse_declare(self) -> exp.Declare | exp.Command:
+            index = self._index
+            expressions = self._try_parse(partial(self._parse_csv, self._parse_declareitem))
+
+            if not expressions or self._curr:
+                self._retreat(index)
+                return self._parse_as_command(self._prev)
+
+            return self.expression(exp.Declare, expressions=expressions)
+
+        def _parse_declareitem(self) -> t.Optional[exp.DeclareItem]:
+            var = self._parse_id_var()
+            if not var:
+                return None
+
+            value = None
+            self._match(TokenType.ALIAS)
+            if self._match(TokenType.TABLE):
+                data_type = self._parse_schema()
+            else:
+                data_type = self._parse_types()
+                if self._match(TokenType.EQ):
+                    value = self._parse_bitwise()
+
+            return self.expression(exp.DeclareItem, this=var, kind=data_type, default=value)
+
     class Generator(generator.Generator):
         LIMIT_IS_TOP = True
         QUERY_HINTS = False
@@ -727,12 +780,15 @@ class TSQL(Dialect):
         SUPPORTS_SELECT_INTO = True
         JSON_PATH_BRACKETED_KEY_SUPPORTED = False
         SUPPORTS_TO_NUMBER = False
-        OUTER_UNION_MODIFIERS = False
+        SET_OP_MODIFIERS = False
         COPY_PARAMS_EQ_REQUIRED = True
+        PARSE_JSON_NAME = None
 
         EXPRESSIONS_WITHOUT_NESTED_CTES = {
             exp.Delete,
             exp.Insert,
+            exp.Intersect,
+            exp.Except,
             exp.Merge,
             exp.Select,
             exp.Subquery,
@@ -753,11 +809,12 @@ class TSQL(Dialect):
             exp.DataType.Type.DATETIME: "DATETIME2",
             exp.DataType.Type.DOUBLE: "FLOAT",
             exp.DataType.Type.INT: "INTEGER",
+            exp.DataType.Type.ROWVERSION: "ROWVERSION",
             exp.DataType.Type.TEXT: "VARCHAR(MAX)",
             exp.DataType.Type.TIMESTAMP: "DATETIME2",
             exp.DataType.Type.TIMESTAMPTZ: "DATETIMEOFFSET",
+            exp.DataType.Type.UTINYINT: "TINYINT",
             exp.DataType.Type.VARIANT: "SQL_VARIANT",
-            exp.DataType.Type.ROWVERSION: "ROWVERSION",
         }
 
         TYPE_MAPPING.pop(exp.DataType.Type.NCHAR)
@@ -785,7 +842,7 @@ class TSQL(Dialect):
             exp.MD5: lambda self, e: self.func("HASHBYTES", exp.Literal.string("MD5"), e.this),
             exp.Min: min_or_least,
             exp.NumberToStr: _format_sql,
-            exp.ParseJSON: lambda self, e: self.sql(e, "this"),
+            exp.Repeat: rename_func("REPLICATE"),
             exp.Select: transforms.preprocess(
                 [
                     transforms.eliminate_distinct_on,
@@ -802,7 +859,9 @@ class TSQL(Dialect):
                 "HASHBYTES", exp.Literal.string(f"SHA2_{e.args.get('length', 256)}"), e.this
             ),
             exp.TemporaryProperty: lambda self, e: "",
-            exp.TimeStrToTime: timestrtotime_sql,
+            exp.TimeStrToTime: lambda self, e: self.sql(
+                exp.cast(e.this, exp.DataType.Type.DATETIME)
+            ),
             exp.TimeToStr: _format_sql,
             exp.Trim: trim_sql,
             exp.TsOrDsAdd: date_delta_sql("DATEADD", cast=True),
@@ -815,6 +874,9 @@ class TSQL(Dialect):
             **generator.Generator.PROPERTIES_LOCATION,
             exp.VolatileProperty: exp.Properties.Location.UNSUPPORTED,
         }
+
+        def scope_resolution(self, rhs: str, scope_name: str) -> str:
+            return f"{scope_name}::{rhs}"
 
         def select_sql(self, expression: exp.Select) -> str:
             if expression.args.get("offset"):
@@ -920,6 +982,10 @@ class TSQL(Dialect):
         def create_sql(self, expression: exp.Create) -> str:
             kind = expression.kind
             exists = expression.args.pop("exists", None)
+
+            if kind == "VIEW":
+                expression.this.set("catalog", None)
+
             sql = super().create_sql(expression)
 
             like_property = expression.find(exp.LikeProperty)
@@ -1061,3 +1127,26 @@ class TSQL(Dialect):
             if isinstance(action, exp.RenameTable):
                 return f"EXEC sp_rename '{self.sql(expression.this)}', '{action.this.name}'"
             return super().altertable_sql(expression)
+
+        def drop_sql(self, expression: exp.Drop) -> str:
+            if expression.args["kind"] == "VIEW":
+                expression.this.set("catalog", None)
+            return super().drop_sql(expression)
+
+        def declare_sql(self, expression: exp.Declare) -> str:
+            return f"DECLARE {self.expressions(expression, flat=True)}"
+
+        def declareitem_sql(self, expression: exp.DeclareItem) -> str:
+            variable = self.sql(expression, "this")
+            default = self.sql(expression, "default")
+            default = f" = {default}" if default else ""
+
+            kind = self.sql(expression, "kind")
+            if isinstance(expression.args.get("kind"), exp.Schema):
+                kind = f"TABLE {kind}"
+
+            return f"{variable} AS {kind}{default}"
+
+        def options_modifier(self, expression: exp.Expression) -> str:
+            options = self.expressions(expression, key="options")
+            return f" OPTION{self.wrap(options)}" if options else ""

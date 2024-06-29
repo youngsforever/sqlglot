@@ -210,6 +210,8 @@ class TestPresto(Validator):
                     "bigquery": f"SELECT INTERVAL '1' {expected}",
                     "presto": f"SELECT INTERVAL '1' {expected}",
                     "trino": f"SELECT INTERVAL '1' {expected}",
+                    "mysql": f"SELECT INTERVAL '1' {expected}",
+                    "doris": f"SELECT INTERVAL '1' {expected}",
                 },
             )
 
@@ -562,6 +564,7 @@ class TestPresto(Validator):
             self.validate_all(
                 f"{prefix}'Hello winter \\2603 !'",
                 write={
+                    "oracle": "U'Hello winter \\2603 !'",
                     "presto": "U&'Hello winter \\2603 !'",
                     "snowflake": "'Hello winter \\u2603 !'",
                     "spark": "'Hello winter \\u2603 !'",
@@ -570,6 +573,7 @@ class TestPresto(Validator):
             self.validate_all(
                 f"{prefix}'Hello winter #2603 !' UESCAPE '#'",
                 write={
+                    "oracle": "U'Hello winter \\2603 !'",
                     "presto": "U&'Hello winter #2603 !' UESCAPE '#'",
                     "snowflake": "'Hello winter \\u2603 !'",
                     "spark": "'Hello winter \\u2603 !'",

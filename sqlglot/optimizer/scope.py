@@ -29,7 +29,7 @@ class Scope:
     Selection scope.
 
     Attributes:
-        expression (exp.Select|exp.Union): Root expression of this scope
+        expression (exp.Select|exp.SetOperation): Root expression of this scope
         sources (dict[str, exp.Table|Scope]): Mapping of source name to either
             a Table expression or another Scope instance. For example:
                 SELECT * FROM x                     {"x": Table(this="x")}
@@ -86,6 +86,7 @@ class Scope:
     def clear_cache(self):
         self._collected = False
         self._raw_columns = None
+        self._stars = None
         self._derived_tables = None
         self._udtfs = None
         self._tables = None
@@ -119,14 +120,20 @@ class Scope:
         self._derived_tables = []
         self._udtfs = []
         self._raw_columns = []
+        self._stars = []
         self._join_hints = []
 
         for node in self.walk(bfs=False):
             if node is self.expression:
                 continue
 
-            if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
-                self._raw_columns.append(node)
+            if isinstance(node, exp.Dot) and node.is_star:
+                self._stars.append(node)
+            elif isinstance(node, exp.Column):
+                if isinstance(node.this, exp.Star):
+                    self._stars.append(node)
+                else:
+                    self._raw_columns.append(node)
             elif isinstance(node, exp.Table) and not isinstance(node.parent, exp.JoinHint):
                 self._tables.append(node)
             elif isinstance(node, exp.JoinHint):
@@ -226,10 +233,18 @@ class Scope:
             SELECT * FROM x WHERE a IN (SELECT ...) <- that's a subquery
 
         Returns:
-            list[exp.Select | exp.Union]: subqueries
+            list[exp.Select | exp.SetOperation]: subqueries
         """
         self._ensure_collected()
         return self._subqueries
+
+    @property
+    def stars(self) -> t.List[exp.Column | exp.Dot]:
+        """
+        List of star expressions (columns or dots) in this scope.
+        """
+        self._ensure_collected()
+        return self._stars
 
     @property
     def columns(self):
@@ -324,7 +339,7 @@ class Scope:
                 sources in the current scope.
         """
         if self._external_columns is None:
-            if isinstance(self.expression, exp.Union):
+            if isinstance(self.expression, exp.SetOperation):
                 left, right = self.union_scopes
                 self._external_columns = left.external_columns + right.external_columns
             else:
@@ -520,7 +535,7 @@ def _traverse_scope(scope):
 
     if isinstance(expression, exp.Select):
         yield from _traverse_select(scope)
-    elif isinstance(expression, exp.Union):
+    elif isinstance(expression, exp.SetOperation):
         yield from _traverse_ctes(scope)
         yield from _traverse_union(scope)
         return
@@ -573,7 +588,7 @@ def _traverse_union(scope):
             scope_type=ScopeType.UNION,
         )
 
-        if isinstance(expression, exp.Union):
+        if isinstance(expression, exp.SetOperation):
             yield from _traverse_ctes(new_scope)
 
             union_scope_stack.append(new_scope)
@@ -605,7 +620,7 @@ def _traverse_ctes(scope):
         if with_ and with_.recursive:
             union = cte.this
 
-            if isinstance(union, exp.Union):
+            if isinstance(union, exp.SetOperation):
                 sources[cte_name] = scope.branch(union.this, scope_type=ScopeType.CTE)
 
         child_scope = None

@@ -24,9 +24,9 @@ def _date_add_sql(
         if not isinstance(value, exp.Literal):
             self.unsupported("Cannot add non literal")
 
-        if value.is_negative:
+        if isinstance(value, exp.Neg):
             kind_to_op = {"+": "-", "-": "+"}
-            value = exp.Literal.string(value.name[1:])
+            value = exp.Literal.string(value.this.to_py())
         else:
             kind_to_op = {"+": "+", "-": "-"}
             value.set("is_string", True)
@@ -96,6 +96,7 @@ class Teradata(Dialect):
             "TOP": TokenType.TOP,
             "UPD": TokenType.UPDATE,
         }
+        KEYWORDS.pop("/*+")
 
         # Teradata does not support % as a modulo operator
         SINGLE_TOKENS = {**tokens.Tokenizer.SINGLE_TOKENS}
@@ -164,7 +165,7 @@ class Teradata(Dialect):
         }
 
         def _parse_translate(self, strict: bool) -> exp.Expression:
-            this = self._parse_conjunction()
+            this = self._parse_assignment()
 
             if not self._match(TokenType.USING):
                 self.raise_error("Expected USING in TRANSLATE")
@@ -195,10 +196,18 @@ class Teradata(Dialect):
             this = self._parse_id_var()
             self._match(TokenType.BETWEEN)
 
-            expressions = self._parse_csv(self._parse_conjunction)
-            each = self._match_text_seq("EACH") and self._parse_conjunction()
+            expressions = self._parse_csv(self._parse_assignment)
+            each = self._match_text_seq("EACH") and self._parse_assignment()
 
             return self.expression(exp.RangeN, this=this, expressions=expressions, each=each)
+
+        def _parse_index_params(self) -> exp.IndexParameters:
+            this = super()._parse_index_params()
+
+            if this.args.get("on"):
+                this.set("on", None)
+                self._retreat(self._index - 2)
+            return this
 
     class Generator(generator.Generator):
         LIMIT_IS_TOP = True

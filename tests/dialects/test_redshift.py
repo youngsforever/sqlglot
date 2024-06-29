@@ -6,6 +6,14 @@ class TestRedshift(Validator):
     dialect = "redshift"
 
     def test_redshift(self):
+        self.validate_identity("1 div", "1 AS div")
+        self.validate_all(
+            "SELECT SPLIT_TO_ARRAY('12,345,6789')",
+            write={
+                "postgres": "SELECT STRING_TO_ARRAY('12,345,6789', ',')",
+                "redshift": "SELECT SPLIT_TO_ARRAY('12,345,6789', ',')",
+            },
+        )
         self.validate_all(
             "GETDATE()",
             read={
@@ -20,7 +28,7 @@ class TestRedshift(Validator):
             """SELECT JSON_EXTRACT_PATH_TEXT('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', 'farm', 'barn', 'color')""",
             write={
                 "bigquery": """SELECT JSON_EXTRACT_SCALAR('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', '$.farm.barn.color')""",
-                "databricks": """SELECT GET_JSON_OBJECT('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', '$.farm.barn.color')""",
+                "databricks": """SELECT '{ "farm": {"barn": { "color": "red", "feed stocked": true }}}':farm.barn.color""",
                 "duckdb": """SELECT '{ "farm": {"barn": { "color": "red", "feed stocked": true }}}' ->> '$.farm.barn.color'""",
                 "postgres": """SELECT JSON_EXTRACT_PATH_TEXT('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', 'farm', 'barn', 'color')""",
                 "presto": """SELECT JSON_EXTRACT_SCALAR('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', '$.farm.barn.color')""",
@@ -220,7 +228,7 @@ class TestRedshift(Validator):
                 "drill": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
                 "hive": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
                 "mysql": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY CASE WHEN c IS NULL THEN 1 ELSE 0 END DESC, c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "oracle": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) _t WHERE _row_number = 1",
+                "oracle": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) AS _row_number FROM x) _t WHERE _row_number = 1",
                 "presto": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
                 "redshift": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
                 "snowflake": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
@@ -251,6 +259,12 @@ class TestRedshift(Validator):
                 "postgres": "COALESCE(a, b, c, d)",
             },
         )
+
+        self.validate_identity(
+            "DATEDIFF(days, a, b)",
+            "DATEDIFF(DAY, a, b)",
+        )
+
         self.validate_all(
             "DATEDIFF('day', a, b)",
             write={
@@ -273,6 +287,9 @@ class TestRedshift(Validator):
                 "redshift": "SELECT DATEADD(MONTH, 18, '2008-02-28')",
                 "snowflake": "SELECT DATEADD(MONTH, 18, CAST('2008-02-28' AS TIMESTAMP))",
                 "tsql": "SELECT DATEADD(MONTH, 18, CAST('2008-02-28' AS DATETIME2))",
+                "spark": "SELECT DATE_ADD(MONTH, 18, '2008-02-28')",
+                "spark2": "SELECT ADD_MONTHS('2008-02-28', 18)",
+                "databricks": "SELECT DATE_ADD(MONTH, 18, '2008-02-28')",
             },
         )
         self.validate_all(
@@ -286,6 +303,14 @@ class TestRedshift(Validator):
                 "redshift": "SELECT DATEDIFF(WEEK, '2009-01-01', '2009-12-31')",
                 "snowflake": "SELECT DATEDIFF(WEEK, '2009-01-01', '2009-12-31')",
                 "tsql": "SELECT DATEDIFF(WEEK, '2009-01-01', '2009-12-31')",
+            },
+        )
+
+        self.validate_all(
+            "SELECT EXTRACT(EPOCH FROM CURRENT_DATE)",
+            write={
+                "snowflake": "SELECT DATE_PART(EPOCH, CURRENT_DATE)",
+                "redshift": "SELECT EXTRACT(EPOCH FROM CURRENT_DATE)",
             },
         )
 
@@ -473,6 +498,10 @@ FROM (
         self.validate_identity("CREATE TABLE table_backup BACKUP YES AS SELECT * FROM event")
         self.validate_identity("CREATE TABLE table_backup (i INTEGER, b VARCHAR) BACKUP NO")
         self.validate_identity("CREATE TABLE table_backup (i INTEGER, b VARCHAR) BACKUP YES")
+        self.validate_identity(
+            "select foo, bar from table_1 minus select foo, bar from table_2",
+            "SELECT foo, bar FROM table_1 EXCEPT SELECT foo, bar FROM table_2",
+        )
 
     def test_create_table_like(self):
         self.validate_identity(
@@ -498,7 +527,25 @@ FROM (
             },
         )
 
-    def test_rename_table(self):
+    def test_alter_table(self):
+        self.validate_identity("ALTER TABLE s.t ALTER SORTKEY (c)")
+        self.validate_identity("ALTER TABLE t ALTER SORTKEY AUTO")
+        self.validate_identity("ALTER TABLE t ALTER SORTKEY NONE")
+        self.validate_identity("ALTER TABLE t ALTER SORTKEY (c1, c2)")
+        self.validate_identity("ALTER TABLE t ALTER SORTKEY (c1, c2)")
+        self.validate_identity("ALTER TABLE t ALTER COMPOUND SORTKEY (c1, c2)")
+        self.validate_identity("ALTER TABLE t ALTER DISTSTYLE ALL")
+        self.validate_identity("ALTER TABLE t ALTER DISTSTYLE EVEN")
+        self.validate_identity("ALTER TABLE t ALTER DISTSTYLE AUTO")
+        self.validate_identity("ALTER TABLE t ALTER DISTSTYLE KEY DISTKEY c")
+        self.validate_identity("ALTER TABLE t SET TABLE PROPERTIES ('a' = '5', 'b' = 'c')")
+        self.validate_identity("ALTER TABLE t SET LOCATION 's3://bucket/folder/'")
+        self.validate_identity("ALTER TABLE t SET FILE FORMAT AVRO")
+        self.validate_identity(
+            "ALTER TABLE t ALTER DISTKEY c",
+            "ALTER TABLE t ALTER DISTSTYLE KEY DISTKEY c",
+        )
+
         self.validate_all(
             "ALTER TABLE db.t1 RENAME TO db.t2",
             write={
@@ -554,4 +601,10 @@ FROM (
         joins[2].this.assert_is(exp.Unnest).expressions[0].assert_is(exp.Dot)
         self.assertEqual(
             ast.sql("redshift"), "SELECT * FROM x AS a, a.b AS c, c.d.e AS f, f.g.h.i.j.k AS l"
+        )
+
+    def test_join_markers(self):
+        self.validate_identity(
+            "select a.foo, b.bar, a.baz from a, b where a.baz = b.baz (+)",
+            "SELECT a.foo, b.bar, a.baz FROM a, b WHERE a.baz = b.baz (+)",
         )

@@ -7,6 +7,8 @@ class TestClickhouse(Validator):
     dialect = "clickhouse"
 
     def test_clickhouse(self):
+        self.validate_identity("extract(haystack, pattern)")
+
         self.validate_all(
             "SELECT * FROM x PREWHERE y = 1 WHERE z = 2",
             write={
@@ -42,6 +44,7 @@ class TestClickhouse(Validator):
         self.assertEqual(expr.sql(dialect="clickhouse"), "COUNT(x)")
         self.assertIsNone(expr._meta)
 
+        self.validate_identity("SELECT CAST(x AS Tuple(String, Array(Nullable(Float64))))")
         self.validate_identity("countIf(x, y)")
         self.validate_identity("x = y")
         self.validate_identity("x <> y")
@@ -424,6 +427,21 @@ class TestClickhouse(Validator):
                 "mysql": "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d')",
             },
         )
+
+        self.validate_identity("ALTER TABLE visits DROP PARTITION 201901")
+        self.validate_identity("ALTER TABLE visits DROP PARTITION ALL")
+        self.validate_identity(
+            "ALTER TABLE visits DROP PARTITION tuple(toYYYYMM(toDate('2019-01-25')))"
+        )
+        self.validate_identity("ALTER TABLE visits DROP PARTITION ID '201901'")
+
+        self.validate_identity("ALTER TABLE visits REPLACE PARTITION 201901 FROM visits_tmp")
+        self.validate_identity("ALTER TABLE visits REPLACE PARTITION ALL FROM visits_tmp")
+        self.validate_identity(
+            "ALTER TABLE visits REPLACE PARTITION tuple(toYYYYMM(toDate('2019-01-25'))) FROM visits_tmp"
+        )
+        self.validate_identity("ALTER TABLE visits REPLACE PARTITION ID '201901' FROM visits_tmp")
+        self.validate_identity("ALTER TABLE visits ON CLUSTER test_cluster DROP COLUMN col1")
 
     def test_cte(self):
         self.validate_identity("WITH 'x' AS foo SELECT foo")
@@ -829,6 +847,9 @@ LIFETIME(MIN 0 MAX 0)""",
         self.validate_identity(
             "CREATE TABLE t1 (a String EPHEMERAL, b String EPHEMERAL func(), c String MATERIALIZED func(), d String ALIAS func()) ENGINE=TinyLog()"
         )
+        self.validate_identity(
+            "CREATE TABLE t (a String, b String, c UInt64, PROJECTION p1 (SELECT a, sum(c) GROUP BY a, b), PROJECTION p2 (SELECT b, sum(c) GROUP BY b)) ENGINE=MergeTree()"
+        )
 
     def test_agg_functions(self):
         def extract_agg_func(query):
@@ -856,3 +877,31 @@ LIFETIME(MIN 0 MAX 0)""",
         )
 
         parse_one("foobar(x)").assert_is(exp.Anonymous)
+
+    def test_drop_on_cluster(self):
+        for creatable in ("DATABASE", "TABLE", "VIEW", "DICTIONARY", "FUNCTION"):
+            with self.subTest(f"Test DROP {creatable} ON CLUSTER"):
+                self.validate_identity(f"DROP {creatable} test ON CLUSTER test_cluster")
+
+    def test_datetime_funcs(self):
+        # Each datetime func has an alias that is roundtripped to the original name e.g. (DATE_SUB, DATESUB) -> DATE_SUB
+        datetime_funcs = (("DATE_SUB", "DATESUB"), ("DATE_ADD", "DATEADD"))
+
+        # 2-arg functions of type <func>(date, unit)
+        for func in (*datetime_funcs, ("TIMESTAMP_ADD", "TIMESTAMPADD")):
+            func_name = func[0]
+            for func_alias in func:
+                self.validate_identity(
+                    f"""SELECT {func_alias}(date, INTERVAL '3' YEAR)""",
+                    f"""SELECT {func_name}(date, INTERVAL '3' YEAR)""",
+                )
+
+        # 3-arg functions of type <func>(unit, value, date)
+        for func in (*datetime_funcs, ("DATE_DIFF", "DATEDIFF"), ("TIMESTAMP_SUB", "TIMESTAMPSUB")):
+            func_name = func[0]
+            for func_alias in func:
+                with self.subTest(f"Test 3-arg date-time function {func_alias}"):
+                    self.validate_identity(
+                        f"SELECT {func_alias}(SECOND, 1, bar)",
+                        f"SELECT {func_name}(SECOND, 1, bar)",
+                    )

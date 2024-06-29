@@ -29,6 +29,7 @@ from sqlglot.dialects.dialect import (
     struct_extract_sql,
     time_format,
     timestrtotime_sql,
+    unit_to_str,
     var_map_sql,
 )
 from sqlglot.transforms import (
@@ -70,7 +71,7 @@ def _add_date_sql(self: Hive.Generator, expression: DATE_ADD_OR_SUB) -> str:
         multiplier *= -1
 
     if expression.expression.is_number:
-        modified_increment = exp.Literal.number(int(expression.text("expression")) * multiplier)
+        modified_increment = exp.Literal.number(expression.expression.to_py() * multiplier)
     else:
         modified_increment = expression.expression
         if multiplier != 1:
@@ -254,7 +255,7 @@ class Hive(Dialect):
             "REFRESH": TokenType.REFRESH,
             "TIMESTAMP AS OF": TokenType.TIMESTAMP_SNAPSHOT,
             "VERSION AS OF": TokenType.VERSION_SNAPSHOT,
-            "WITH SERDEPROPERTIES": TokenType.SERDE_PROPERTIES,
+            "SERDEPROPERTIES": TokenType.SERDE_PROPERTIES,
         }
 
         NUMERIC_LITERALS = {
@@ -318,6 +319,7 @@ class Hive(Dialect):
             ),
             "TO_DATE": build_formatted_time(exp.TsOrDsToDate, "hive"),
             "TO_JSON": exp.JSONFormat.from_arg_list,
+            "TRUNC": exp.TimestampTrunc.from_arg_list,
             "UNBASE64": exp.FromBase64.from_arg_list,
             "UNIX_TIMESTAMP": lambda args: build_formatted_time(exp.StrToUnix, "hive", True)(
                 args or [exp.CurrentTimestamp()]
@@ -332,7 +334,7 @@ class Hive(Dialect):
 
         PROPERTY_PARSERS = {
             **parser.Parser.PROPERTY_PARSERS,
-            "WITH SERDEPROPERTIES": lambda self: exp.SerdeProperties(
+            "SERDEPROPERTIES": lambda self: exp.SerdeProperties(
                 expressions=self._parse_wrapped_csv(self._parse_property)
             ),
         }
@@ -415,12 +417,21 @@ class Hive(Dialect):
         ) -> t.Tuple[t.List[exp.Expression], t.Optional[exp.Expression]]:
             return (
                 (
-                    self._parse_csv(self._parse_conjunction)
+                    self._parse_csv(self._parse_assignment)
                     if self._match_set({TokenType.PARTITION_BY, TokenType.DISTRIBUTE_BY})
                     else []
                 ),
                 super()._parse_order(skip_order_token=self._match(TokenType.SORT_BY)),
             )
+
+        def _parse_parameter(self) -> exp.Parameter:
+            self._match(TokenType.L_BRACE)
+            this = self._parse_identifier() or self._parse_primary_or_var()
+            expression = self._match(TokenType.COLON) and (
+                self._parse_identifier() or self._parse_primary_or_var()
+            )
+            self._match(TokenType.R_BRACE)
+            return self.expression(exp.Parameter, this=this, expression=expression)
 
     class Generator(generator.Generator):
         LIMIT_FETCH = "LIMIT"
@@ -434,12 +445,14 @@ class Hive(Dialect):
         LAST_DAY_SUPPORTS_DATE_PART = False
         JSON_PATH_SINGLE_QUOTE_ESCAPE = True
         SUPPORTS_TO_NUMBER = False
+        WITH_PROPERTIES_PREFIX = "TBLPROPERTIES"
+        PARSE_JSON_NAME = None
 
         EXPRESSIONS_WITHOUT_NESTED_CTES = {
             exp.Insert,
             exp.Select,
             exp.Subquery,
-            exp.Union,
+            exp.SetOperation,
         }
 
         SUPPORTED_JSON_PATH_PARTS = {
@@ -453,11 +466,12 @@ class Hive(Dialect):
             **generator.Generator.TYPE_MAPPING,
             exp.DataType.Type.BIT: "BOOLEAN",
             exp.DataType.Type.DATETIME: "TIMESTAMP",
+            exp.DataType.Type.ROWVERSION: "BINARY",
             exp.DataType.Type.TEXT: "STRING",
             exp.DataType.Type.TIME: "TIMESTAMP",
             exp.DataType.Type.TIMESTAMPTZ: "TIMESTAMP",
+            exp.DataType.Type.UTINYINT: "SMALLINT",
             exp.DataType.Type.VARBINARY: "BINARY",
-            exp.DataType.Type.ROWVERSION: "BINARY",
         }
 
         TRANSFORMS = {
@@ -537,6 +551,7 @@ class Hive(Dialect):
             exp.TimeStrToDate: rename_func("TO_DATE"),
             exp.TimeStrToTime: timestrtotime_sql,
             exp.TimeStrToUnix: rename_func("UNIX_TIMESTAMP"),
+            exp.TimestampTrunc: lambda self, e: self.func("TRUNC", e.this, unit_to_str(e)),
             exp.TimeToStr: lambda self, e: self.func("DATE_FORMAT", e.this, self.format_time(e)),
             exp.TimeToUnix: rename_func("UNIX_TIMESTAMP"),
             exp.ToBase64: rename_func("BASE64"),
@@ -552,7 +567,6 @@ class Hive(Dialect):
             exp.UnixToTime: _unix_to_time_sql,
             exp.UnixToTimeStr: rename_func("FROM_UNIXTIME"),
             exp.PartitionedByProperty: lambda self, e: f"PARTITIONED BY {self.sql(e, 'this')}",
-            exp.SerdeProperties: lambda self, e: self.properties(e, prefix="WITH SERDEPROPERTIES"),
             exp.NumberToStr: rename_func("FORMAT_NUMBER"),
             exp.National: lambda self, e: self.national_sql(e, prefix=""),
             exp.ClusteredColumnConstraint: lambda self,
@@ -562,6 +576,9 @@ class Hive(Dialect):
             exp.NotForReplicationColumnConstraint: lambda *_: "",
             exp.OnProperty: lambda *_: "",
             exp.PrimaryKeyColumnConstraint: lambda *_: "PRIMARY KEY",
+            exp.WeekOfYear: rename_func("WEEKOFYEAR"),
+            exp.DayOfMonth: rename_func("DAYOFMONTH"),
+            exp.DayOfWeek: rename_func("DAYOFWEEK"),
         }
 
         PROPERTIES_LOCATION = {
@@ -618,9 +635,6 @@ class Hive(Dialect):
                 expression.this.this if isinstance(expression.this, exp.Order) else expression.this,
             )
 
-        def with_properties(self, properties: exp.Properties) -> str:
-            return self.properties(properties, prefix=self.seg("TBLPROPERTIES"))
-
         def datatype_sql(self, expression: exp.DataType) -> str:
             if expression.this in self.PARAMETERIZABLE_TEXT_TYPES and (
                 not expression.expressions or expression.expressions[0].name == "MAX"
@@ -655,3 +669,23 @@ class Hive(Dialect):
                     values.append(e)
 
             return self.func("STRUCT", *values)
+
+        def alterset_sql(self, expression: exp.AlterSet) -> str:
+            exprs = self.expressions(expression, flat=True)
+            exprs = f" {exprs}" if exprs else ""
+            location = self.sql(expression, "location")
+            location = f" LOCATION {location}" if location else ""
+            file_format = self.expressions(expression, key="file_format", flat=True, sep=" ")
+            file_format = f" FILEFORMAT {file_format}" if file_format else ""
+            serde = self.sql(expression, "serde")
+            serde = f" SERDE {serde}" if serde else ""
+            tags = self.expressions(expression, key="tag", flat=True, sep="")
+            tags = f" TAGS {tags}" if tags else ""
+
+            return f"SET{serde}{exprs}{location}{file_format}{tags}"
+
+        def serdeproperties_sql(self, expression: exp.SerdeProperties) -> str:
+            prefix = "WITH " if expression.args.get("with") else ""
+            exprs = self.expressions(expression, flat=True)
+
+            return f"{prefix}SERDEPROPERTIES ({exprs})"

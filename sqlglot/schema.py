@@ -6,14 +6,13 @@ import typing as t
 from sqlglot import expressions as exp
 from sqlglot.dialects.dialect import Dialect
 from sqlglot.errors import SchemaError
-from sqlglot.helper import dict_depth
+from sqlglot.helper import dict_depth, first
 from sqlglot.trie import TrieResult, in_trie, new_trie
 
 if t.TYPE_CHECKING:
-    from sqlglot.dataframe.sql.types import StructType
     from sqlglot.dialects.dialect import DialectType
 
-    ColumnMapping = t.Union[t.Dict, str, StructType, t.List]
+    ColumnMapping = t.Union[t.Dict, str, t.List]
 
 
 class Schema(abc.ABC):
@@ -156,13 +155,16 @@ class AbstractMappingSchema:
             return [table.this.name]
         return [table.text(part) for part in exp.TABLE_PARTS if table.text(part)]
 
-    def find(self, table: exp.Table, raise_on_missing: bool = True) -> t.Optional[t.Any]:
+    def find(
+        self, table: exp.Table, raise_on_missing: bool = True, ensure_data_types: bool = False
+    ) -> t.Optional[t.Any]:
         """
         Returns the schema of a given table.
 
         Args:
             table: the target table.
             raise_on_missing: whether to raise in case the schema is not found.
+            ensure_data_types: whether to convert `str` types to their `DataType` equivalents.
 
         Returns:
             The schema of the target table.
@@ -174,7 +176,7 @@ class AbstractMappingSchema:
             return None
 
         if value == TrieResult.PREFIX:
-            possibilities = flatten_schema(trie, depth=dict_depth(trie) - 1)
+            possibilities = flatten_schema(trie)
 
             if len(possibilities) == 1:
                 parts.extend(possibilities[0])
@@ -239,6 +241,20 @@ class MappingSchema(AbstractMappingSchema, Schema):
             dialect=mapping_schema.dialect,
             normalize=mapping_schema.normalize,
         )
+
+    def find(
+        self, table: exp.Table, raise_on_missing: bool = True, ensure_data_types: bool = False
+    ) -> t.Optional[t.Any]:
+        schema = super().find(
+            table, raise_on_missing=raise_on_missing, ensure_data_types=ensure_data_types
+        )
+        if ensure_data_types and isinstance(schema, dict):
+            schema = {
+                col: self._to_data_type(dtype) if isinstance(dtype, str) else dtype
+                for col, dtype in schema.items()
+            }
+
+        return schema
 
     def copy(self, **kwargs) -> MappingSchema:
         return MappingSchema(
@@ -362,14 +378,21 @@ class MappingSchema(AbstractMappingSchema, Schema):
             The normalized schema mapping.
         """
         normalized_mapping: t.Dict = {}
-        flattened_schema = flatten_schema(schema, depth=dict_depth(schema) - 1)
+        flattened_schema = flatten_schema(schema)
+        error_msg = "Table {} must match the schema's nesting level: {}."
 
         for keys in flattened_schema:
             columns = nested_get(schema, *zip(keys, keys))
 
             if not isinstance(columns, dict):
+                raise SchemaError(error_msg.format(".".join(keys[:-1]), len(flattened_schema[0])))
+            if not columns:
+                raise SchemaError(f"Table {'.'.join(keys[:-1])} must have at least one column")
+            if isinstance(first(columns.values()), dict):
                 raise SchemaError(
-                    f"Table {'.'.join(keys[:-1])} must match the schema's nesting level: {len(flattened_schema[0])}."
+                    error_msg.format(
+                        ".".join(keys + flatten_schema(columns)[0]), len(flattened_schema[0])
+                    ),
                 )
 
             normalized_keys = [self._normalize_name(key, is_table=True) for key in keys]
@@ -484,9 +507,6 @@ def ensure_column_mapping(mapping: t.Optional[ColumnMapping]) -> t.Dict:
             name_type_str.split(":")[0].strip(): name_type_str.split(":")[1].strip()
             for name_type_str in col_name_type_strs
         }
-    # Check if mapping looks like a DataFrame StructType
-    elif hasattr(mapping, "simpleString"):
-        return {struct_field.name: struct_field.dataType.simpleString() for struct_field in mapping}
     elif isinstance(mapping, list):
         return {x.strip(): None for x in mapping}
 
@@ -494,16 +514,17 @@ def ensure_column_mapping(mapping: t.Optional[ColumnMapping]) -> t.Dict:
 
 
 def flatten_schema(
-    schema: t.Dict, depth: int, keys: t.Optional[t.List[str]] = None
+    schema: t.Dict, depth: t.Optional[int] = None, keys: t.Optional[t.List[str]] = None
 ) -> t.List[t.List[str]]:
     tables = []
     keys = keys or []
+    depth = dict_depth(schema) - 1 if depth is None else depth
 
     for k, v in schema.items():
-        if depth >= 2:
-            tables.extend(flatten_schema(v, depth - 1, keys + [k]))
-        elif depth == 1:
+        if depth == 1 or not isinstance(v, dict):
             tables.append(keys + [k])
+        elif depth >= 2:
+            tables.extend(flatten_schema(v, depth - 1, keys + [k]))
 
     return tables
 

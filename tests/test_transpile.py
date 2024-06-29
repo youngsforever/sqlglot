@@ -112,6 +112,10 @@ class TestTranspile(unittest.TestCase):
 
     def test_comments(self):
         self.validate(
+            "select /* asfd /* asdf */ asdf */ 1",
+            "/* asfd /* asdf */ asdf */ SELECT 1",
+        )
+        self.validate(
             "SELECT c /* foo */ AS alias",
             "SELECT c AS alias /* foo */",
         )
@@ -551,6 +555,13 @@ FROM x""",
             pretty=True,
         )
 
+        self.validate(
+            """SELECT X FROM  catalog.db.table WHERE Y
+        --
+        AND Z""",
+            """SELECT X FROM catalog.db.table WHERE Y AND Z""",
+        )
+
     def test_types(self):
         self.validate("INT 1", "CAST(1 AS INT)")
         self.validate("VARCHAR 'x' y", "CAST('x' AS VARCHAR) AS y")
@@ -578,24 +589,24 @@ FROM x""",
     def test_extract(self):
         self.validate(
             "EXTRACT(day FROM '2020-01-01'::TIMESTAMP)",
-            "EXTRACT(day FROM CAST('2020-01-01' AS TIMESTAMP))",
+            "EXTRACT(DAY FROM CAST('2020-01-01' AS TIMESTAMP))",
         )
         self.validate(
             "EXTRACT(timezone FROM '2020-01-01'::TIMESTAMP)",
-            "EXTRACT(timezone FROM CAST('2020-01-01' AS TIMESTAMP))",
+            "EXTRACT(TIMEZONE FROM CAST('2020-01-01' AS TIMESTAMP))",
         )
         self.validate(
             "EXTRACT(year FROM '2020-01-01'::TIMESTAMP WITH TIME ZONE)",
-            "EXTRACT(year FROM CAST('2020-01-01' AS TIMESTAMPTZ))",
+            "EXTRACT(YEAR FROM CAST('2020-01-01' AS TIMESTAMPTZ))",
         )
         self.validate(
             "extract(month from '2021-01-31'::timestamp without time zone)",
-            "EXTRACT(month FROM CAST('2021-01-31' AS TIMESTAMP))",
+            "EXTRACT(MONTH FROM CAST('2021-01-31' AS TIMESTAMP))",
         )
-        self.validate("extract(week from current_date + 2)", "EXTRACT(week FROM CURRENT_DATE + 2)")
+        self.validate("extract(week from current_date + 2)", "EXTRACT(WEEK FROM CURRENT_DATE + 2)")
         self.validate(
             "EXTRACT(minute FROM datetime1 - datetime2)",
-            "EXTRACT(minute FROM datetime1 - datetime2)",
+            "EXTRACT(MINUTE FROM datetime1 - datetime2)",
         )
 
     def test_if(self):

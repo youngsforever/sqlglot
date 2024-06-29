@@ -674,7 +674,9 @@ class TestExpressions(unittest.TestCase):
         self.assertIsInstance(parse_one("STANDARD_HASH('hello', 'sha256')"), exp.StandardHash)
         self.assertIsInstance(parse_one("DATE(foo)"), exp.Date)
         self.assertIsInstance(parse_one("HEX(foo)"), exp.Hex)
-        self.assertIsInstance(parse_one("TO_HEX(foo)", read="bigquery"), exp.Hex)
+        self.assertIsInstance(parse_one("LOWER(HEX(foo))"), exp.LowerHex)
+        self.assertIsInstance(parse_one("TO_HEX(foo)", read="bigquery"), exp.LowerHex)
+        self.assertIsInstance(parse_one("UPPER(TO_HEX(foo))", read="bigquery"), exp.Hex)
         self.assertIsInstance(parse_one("TO_HEX(MD5(foo))", read="bigquery"), exp.MD5)
         self.assertIsInstance(parse_one("TRANSFORM(a, b)", read="spark"), exp.Transform)
         self.assertIsInstance(parse_one("ADD_MONTHS(a, b)"), exp.AddMonths)
@@ -834,21 +836,22 @@ class TestExpressions(unittest.TestCase):
             b AS B,
             c, /*comment*/
             d AS D, -- another comment
-            CAST(x AS INT) -- final comment
+            CAST(x AS INT), -- yet another comment
+            y AND /* foo */ w AS E -- final comment
         FROM foo
         """
         expression = parse_one(sql)
         self.assertEqual(
             [e.alias_or_name for e in expression.expressions],
-            ["a", "B", "c", "D", "x"],
+            ["a", "B", "c", "D", "x", "E"],
         )
         self.assertEqual(
             expression.sql(),
-            "SELECT a, b AS B, c /* comment */, d AS D /* another comment */, CAST(x AS INT) /* final comment */ FROM foo",
+            "SELECT a, b AS B, c /* comment */, d AS D /* another comment */, CAST(x AS INT) /* yet another comment */, y AND /* foo */ w AS E /* final comment */ FROM foo",
         )
         self.assertEqual(
             expression.sql(comments=False),
-            "SELECT a, b AS B, c, d AS D, CAST(x AS INT) FROM foo",
+            "SELECT a, b AS B, c, d AS D, CAST(x AS INT), y AND w AS E FROM foo",
         )
         self.assertEqual(
             expression.sql(pretty=True, comments=False),
@@ -857,7 +860,8 @@ class TestExpressions(unittest.TestCase):
   b AS B,
   c,
   d AS D,
-  CAST(x AS INT)
+  CAST(x AS INT),
+  y AND w AS E
 FROM foo""",
         )
         self.assertEqual(
@@ -867,7 +871,8 @@ FROM foo""",
   b AS B,
   c, /* comment */
   d AS D, /* another comment */
-  CAST(x AS INT) /* final comment */
+  CAST(x AS INT), /* yet another comment */
+  y AND /* foo */ w AS E /* final comment */
 FROM foo""",
         )
 
@@ -1006,12 +1011,18 @@ FROM foo""",
             "ALTER TABLE t1 RENAME TO t2",
         )
 
-    def test_is_negative(self):
-        self.assertTrue(parse_one("-1").is_negative)
-        self.assertTrue(parse_one("- 1.0").is_negative)
-        self.assertTrue(exp.Literal.number("-1").is_negative)
-        self.assertFalse(parse_one("1").is_negative)
-        self.assertFalse(parse_one("x").is_negative)
+    def test_to_py(self):
+        self.assertEqual(parse_one("- -1").to_py(), 1)
+        self.assertIs(parse_one("TRUE").to_py(), True)
+        self.assertIs(parse_one("1").to_py(), 1)
+        self.assertIs(parse_one("'1'").to_py(), "1")
+        self.assertIs(parse_one("null").to_py(), None)
+
+        with self.assertRaises(ValueError):
+            parse_one("x").to_py()
+
+    def test_is_int(self):
+        self.assertTrue(parse_one("- -1").is_int)
 
     def test_is_star(self):
         assert parse_one("*").is_star

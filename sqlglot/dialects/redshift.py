@@ -12,6 +12,7 @@ from sqlglot.dialects.dialect import (
     json_extract_segments,
     no_tablesample_sql,
     rename_func,
+    map_date_part,
 )
 from sqlglot.dialects.postgres import Postgres
 from sqlglot.helper import seq_get
@@ -23,7 +24,11 @@ if t.TYPE_CHECKING:
 
 def _build_date_delta(expr_type: t.Type[E]) -> t.Callable[[t.List], E]:
     def _builder(args: t.List) -> E:
-        expr = expr_type(this=seq_get(args, 2), expression=seq_get(args, 1), unit=seq_get(args, 0))
+        expr = expr_type(
+            this=seq_get(args, 2),
+            expression=seq_get(args, 1),
+            unit=map_date_part(seq_get(args, 0)),
+        )
         if expr_type is exp.TsOrDsAdd:
             expr.set("return_type", exp.DataType.build("TIMESTAMP"))
 
@@ -39,6 +44,7 @@ class Redshift(Postgres):
     SUPPORTS_USER_DEFINED_TYPES = False
     INDEX_OFFSET = 0
     COPY_PARAMS_ARE_CSV = False
+    HEX_LOWERCASE = True
 
     TIME_FORMAT = "'YYYY-MM-DD HH:MI:SS'"
     TIME_MAPPING = {
@@ -62,6 +68,9 @@ class Redshift(Postgres):
             "DATE_DIFF": _build_date_delta(exp.TsOrDsDiff),
             "GETDATE": exp.CurrentTimestamp.from_arg_list,
             "LISTAGG": exp.GroupConcat.from_arg_list,
+            "SPLIT_TO_ARRAY": lambda args: exp.StringToArray(
+                this=seq_get(args, 0), expression=seq_get(args, 1) or exp.Literal.string(",")
+            ),
             "STRTOL": exp.FromBase.from_arg_list,
         }
 
@@ -118,7 +127,9 @@ class Redshift(Postgres):
 
         KEYWORDS = {
             **Postgres.Tokenizer.KEYWORDS,
+            "(+)": TokenType.JOIN_MARKER,
             "HLLSKETCH": TokenType.HLLSKETCH,
+            "MINUS": TokenType.EXCEPT,
             "SUPER": TokenType.SUPER,
             "TOP": TokenType.TOP,
             "UNLOAD": TokenType.COMMAND,
@@ -140,6 +151,11 @@ class Redshift(Postgres):
         CAN_IMPLEMENT_ARRAY_ANY = False
         MULTI_ARG_DISTINCT = True
         COPY_PARAMS_ARE_WRAPPED = False
+        HEX_FUNC = "TO_HEX"
+        PARSE_JSON_NAME = "JSON_PARSE"
+
+        # Redshift doesn't have `WITH` as part of their with_properties so we remove it
+        WITH_PROPERTIES_PREFIX = " "
 
         TYPE_MAPPING = {
             **Postgres.Generator.TYPE_MAPPING,
@@ -169,7 +185,7 @@ class Redshift(Postgres):
             exp.JSONExtract: json_extract_segments("JSON_EXTRACT_PATH_TEXT"),
             exp.JSONExtractScalar: json_extract_segments("JSON_EXTRACT_PATH_TEXT"),
             exp.GroupConcat: rename_func("LISTAGG"),
-            exp.ParseJSON: rename_func("JSON_PARSE"),
+            exp.Hex: lambda self, e: self.func("UPPER", self.func("TO_HEX", self.sql(e, "this"))),
             exp.Select: transforms.preprocess(
                 [
                     transforms.eliminate_distinct_on,
@@ -181,6 +197,7 @@ class Redshift(Postgres):
             e: f"{'COMPOUND ' if e.args['compound'] else ''}SORTKEY({self.format_args(*e.this)})",
             exp.StartsWith: lambda self,
             e: f"{self.sql(e.this)} LIKE {self.sql(e.expression)} || '%'",
+            exp.StringToArray: rename_func("SPLIT_TO_ARRAY"),
             exp.TableSample: no_tablesample_sql,
             exp.TsOrDsAdd: date_delta_sql("DATEADD"),
             exp.TsOrDsDiff: date_delta_sql("DATEDIFF"),
@@ -191,14 +208,16 @@ class Redshift(Postgres):
         # Postgres maps exp.Pivot to no_pivot_sql, but Redshift support pivots
         TRANSFORMS.pop(exp.Pivot)
 
+        # Postgres doesn't support JSON_PARSE, but Redshift does
+        TRANSFORMS.pop(exp.ParseJSON)
+
         # Redshift uses the POW | POWER (expr1, expr2) syntax instead of expr1 ^ expr2 (postgres)
         TRANSFORMS.pop(exp.Pow)
 
-        # Redshift supports ANY_VALUE(..)
+        # Redshift supports these functions
         TRANSFORMS.pop(exp.AnyValue)
-
-        # Redshift supports LAST_DAY(..)
         TRANSFORMS.pop(exp.LastDay)
+        TRANSFORMS.pop(exp.SHA2)
 
         RESERVED_KEYWORDS = {
             "aes128",
@@ -372,10 +391,6 @@ class Redshift(Postgres):
             alias = self.expressions(expression.args.get("alias"), key="columns", flat=True)
             return f"{arg} AS {alias}" if alias else arg
 
-        def with_properties(self, properties: exp.Properties) -> str:
-            """Redshift doesn't have `WITH` as part of their with_properties so we remove it"""
-            return self.properties(properties, prefix=" ", suffix="")
-
         def cast_sql(self, expression: exp.Cast, safe_prefix: t.Optional[str] = None) -> str:
             if expression.is_type(exp.DataType.Type.JSON):
                 # Redshift doesn't support a JSON type, so casting to it is treated as a noop
@@ -398,3 +413,13 @@ class Redshift(Postgres):
                     expression.append("expressions", exp.var("MAX"))
 
             return super().datatype_sql(expression)
+
+        def alterset_sql(self, expression: exp.AlterSet) -> str:
+            exprs = self.expressions(expression, flat=True)
+            exprs = f" TABLE PROPERTIES ({exprs})" if exprs else ""
+            location = self.sql(expression, "location")
+            location = f" LOCATION {location}" if location else ""
+            file_format = self.expressions(expression, key="file_format", flat=True, sep=" ")
+            file_format = f" FILE FORMAT {file_format}" if file_format else ""
+
+            return f"SET{exprs}{location}{file_format}"
