@@ -3,41 +3,134 @@ from __future__ import annotations
 import typing as t
 
 from sqlglot import expressions as exp
-from sqlglot.helper import find_new_name, name_sequence
+from sqlglot.errors import UnsupportedError
+from sqlglot.helper import find_new_name, name_sequence, seq_get
+
 
 if t.TYPE_CHECKING:
+    from sqlglot._typing import E
     from sqlglot.generator import Generator
 
 
-def unalias_group(expression: exp.Expression) -> exp.Expression:
+def preprocess(
+    transforms: t.List[t.Callable[[exp.Expression], exp.Expression]],
+    generator: t.Optional[t.Callable[[Generator, exp.Expression], str]] = None,
+) -> t.Callable[[Generator, exp.Expression], str]:
     """
-    Replace references to select aliases in GROUP BY clauses.
-
-    Example:
-        >>> import sqlglot
-        >>> sqlglot.parse_one("SELECT a AS b FROM x GROUP BY b").transform(unalias_group).sql()
-        'SELECT a AS b FROM x GROUP BY 1'
+    Creates a new transform by chaining a sequence of transformations and converts the resulting
+    expression to SQL, using either the "_sql" method corresponding to the resulting expression,
+    or the appropriate `Generator.TRANSFORMS` function (when applicable -- see below).
 
     Args:
-        expression: the expression that will be transformed.
+        transforms: sequence of transform functions. These will be called in order.
 
     Returns:
-        The transformed expression.
+        Function that can be used as a generator transform.
     """
-    if isinstance(expression, exp.Group) and isinstance(expression.parent, exp.Select):
-        aliased_selects = {
-            e.alias: i
-            for i, e in enumerate(expression.parent.expressions, start=1)
-            if isinstance(e, exp.Alias)
-        }
 
-        for group_by in expression.expressions:
+    def _to_sql(self, expression: exp.Expression) -> str:
+        expression_type = type(expression)
+
+        try:
+            expression = transforms[0](expression)
+            for transform in transforms[1:]:
+                expression = transform(expression)
+        except UnsupportedError as unsupported_error:
+            self.unsupported(str(unsupported_error))
+
+        if generator:
+            return generator(self, expression)
+
+        _sql_handler = getattr(self, expression.key + "_sql", None)
+        if _sql_handler:
+            return _sql_handler(expression)
+
+        transforms_handler = self.TRANSFORMS.get(type(expression))
+        if transforms_handler:
+            if expression_type is type(expression):
+                if isinstance(expression, exp.Func):
+                    return self.function_fallback_sql(expression)
+
+                # Ensures we don't enter an infinite loop. This can happen when the original expression
+                # has the same type as the final expression and there's no _sql method available for it,
+                # because then it'd re-enter _to_sql.
+                raise ValueError(
+                    f"Expression type {expression.__class__.__name__} requires a _sql method in order to be transformed."
+                )
+
+            return transforms_handler(self, expression)
+
+        raise ValueError(f"Unsupported expression type {expression.__class__.__name__}.")
+
+    return _to_sql
+
+
+def unnest_generate_date_array_using_recursive_cte(expression: exp.Expression) -> exp.Expression:
+    if isinstance(expression, exp.Select):
+        count = 0
+        recursive_ctes = []
+
+        for unnest in expression.find_all(exp.Unnest):
             if (
-                isinstance(group_by, exp.Column)
-                and not group_by.table
-                and group_by.name in aliased_selects
+                not isinstance(unnest.parent, (exp.From, exp.Join))
+                or len(unnest.expressions) != 1
+                or not isinstance(unnest.expressions[0], exp.GenerateDateArray)
             ):
-                group_by.replace(exp.Literal.number(aliased_selects.get(group_by.name)))
+                continue
+
+            generate_date_array = unnest.expressions[0]
+            start = generate_date_array.args.get("start")
+            end = generate_date_array.args.get("end")
+            step = generate_date_array.args.get("step")
+
+            if not start or not end or not isinstance(step, exp.Interval):
+                continue
+
+            alias = unnest.args.get("alias")
+            column_name = alias.columns[0] if isinstance(alias, exp.TableAlias) else "date_value"
+
+            start = exp.cast(start, "date")
+            date_add = exp.func(
+                "date_add", column_name, exp.Literal.number(step.name), step.args.get("unit")
+            )
+            cast_date_add = exp.cast(date_add, "date")
+
+            cte_name = "_generated_dates" + (f"_{count}" if count else "")
+
+            base_query = exp.select(start.as_(column_name))
+            recursive_query = (
+                exp.select(cast_date_add)
+                .from_(cte_name)
+                .where(cast_date_add <= exp.cast(end, "date"))
+            )
+            cte_query = base_query.union(recursive_query, distinct=False)
+
+            generate_dates_query = exp.select(column_name).from_(cte_name)
+            unnest.replace(generate_dates_query.subquery(cte_name))
+
+            recursive_ctes.append(
+                exp.alias_(exp.CTE(this=cte_query), cte_name, table=[column_name])
+            )
+            count += 1
+
+        if recursive_ctes:
+            with_expression = expression.args.get("with_") or exp.With()
+            with_expression.set("recursive", True)
+            with_expression.set("expressions", [*recursive_ctes, *with_expression.expressions])
+            expression.set("with_", with_expression)
+
+    return expression
+
+
+def unnest_generate_series(expression: exp.Expression) -> exp.Expression:
+    """Unnests GENERATE_SERIES or SEQUENCE table references."""
+    this = expression.this
+    if isinstance(expression, exp.Table) and isinstance(this, exp.GenerateSeries):
+        unnest = exp.Unnest(expressions=[this])
+        if expression.alias:
+            return exp.alias_(unnest, alias="_u", table=[expression.alias], copy=False)
+
+        return unnest
 
     return expression
 
@@ -57,27 +150,42 @@ def eliminate_distinct_on(expression: exp.Expression) -> exp.Expression:
     if (
         isinstance(expression, exp.Select)
         and expression.args.get("distinct")
-        and expression.args["distinct"].args.get("on")
-        and isinstance(expression.args["distinct"].args["on"], exp.Tuple)
+        and isinstance(expression.args["distinct"].args.get("on"), exp.Tuple)
     ):
-        distinct_cols = expression.args["distinct"].pop().args["on"].expressions
-        outer_selects = expression.selects
-        row_number = find_new_name(expression.named_selects, "_row_number")
-        window = exp.Window(this=exp.RowNumber(), partition_by=distinct_cols)
-        order = expression.args.get("order")
+        row_number_window_alias = find_new_name(expression.named_selects, "_row_number")
 
+        distinct_cols = expression.args["distinct"].pop().args["on"].expressions
+        window = exp.Window(this=exp.RowNumber(), partition_by=distinct_cols)
+
+        order = expression.args.get("order")
         if order:
             window.set("order", order.pop())
         else:
             window.set("order", exp.Order(expressions=[c.copy() for c in distinct_cols]))
 
-        window = exp.alias_(window, row_number)
+        window = exp.alias_(window, row_number_window_alias)
         expression.select(window, copy=False)
 
+        # We add aliases to the projections so that we can safely reference them in the outer query
+        new_selects = []
+        taken_names = {row_number_window_alias}
+        for select in expression.selects[:-1]:
+            if select.is_star:
+                new_selects = [exp.Star()]
+                break
+
+            if not isinstance(select, exp.Alias):
+                alias = find_new_name(taken_names, select.output_name or "_col")
+                quoted = select.this.args.get("quoted") if isinstance(select, exp.Column) else None
+                select = select.replace(exp.alias_(select, alias, quoted=quoted))
+
+            taken_names.add(select.output_name)
+            new_selects.append(select.args["alias"])
+
         return (
-            exp.select(*outer_selects, copy=False)
+            exp.select(*new_selects, copy=False)
             .from_(expression.subquery("_t", copy=False), copy=False)
-            .where(exp.column(row_number).eq(1), copy=False)
+            .where(exp.column(row_number_window_alias).eq(1), copy=False)
         )
 
     return expression
@@ -105,7 +213,14 @@ def eliminate_qualify(expression: exp.Expression) -> exp.Expression:
                 select.replace(exp.alias_(select, alias))
                 taken.add(alias)
 
-        outer_selects = exp.select(*[select.alias_or_name for select in expression.selects])
+        def _select_alias_or_name(select: exp.Expression) -> str | exp.Column:
+            alias_or_name = select.alias_or_name
+            identifier = select.args.get("alias") or select.this
+            if isinstance(identifier, exp.Identifier):
+                return exp.column(alias_or_name, quoted=identifier.args.get("quoted"))
+            return alias_or_name
+
+        outer_selects = exp.select(*list(map(_select_alias_or_name, expression.selects)))
         qualify_filters = expression.args["qualify"].pop().this
         expression_by_alias = {
             select.alias: select.this
@@ -114,7 +229,7 @@ def eliminate_qualify(expression: exp.Expression) -> exp.Expression:
         }
 
         select_candidates = exp.Window if expression.is_star else (exp.Window, exp.Column)
-        for select_candidate in qualify_filters.find_all(select_candidates):
+        for select_candidate in list(qualify_filters.find_all(select_candidates)):
             if isinstance(select_candidate, exp.Window):
                 if expression_by_alias:
                     for column in select_candidate.find_all(exp.Column):
@@ -165,43 +280,123 @@ def unqualify_unnest(expression: exp.Expression) -> exp.Expression:
         }
         if unnest_aliases:
             for column in expression.find_all(exp.Column):
-                if column.table in unnest_aliases:
-                    column.set("table", None)
-                elif column.db in unnest_aliases:
-                    column.set("db", None)
+                leftmost_part = column.parts[0]
+                if leftmost_part.arg_key != "this" and leftmost_part.this in unnest_aliases:
+                    leftmost_part.pop()
 
     return expression
 
 
-def unnest_to_explode(expression: exp.Expression) -> exp.Expression:
+def unnest_to_explode(
+    expression: exp.Expression,
+    unnest_using_arrays_zip: bool = True,
+) -> exp.Expression:
     """Convert cross join unnest into lateral view explode."""
+
+    def _unnest_zip_exprs(
+        u: exp.Unnest, unnest_exprs: t.List[exp.Expression], has_multi_expr: bool
+    ) -> t.List[exp.Expression]:
+        if has_multi_expr:
+            if not unnest_using_arrays_zip:
+                raise UnsupportedError("Cannot transpile UNNEST with multiple input arrays")
+
+            # Use INLINE(ARRAYS_ZIP(...)) for multiple expressions
+            zip_exprs: t.List[exp.Expression] = [
+                exp.Anonymous(this="ARRAYS_ZIP", expressions=unnest_exprs)
+            ]
+            u.set("expressions", zip_exprs)
+            return zip_exprs
+        return unnest_exprs
+
+    def _udtf_type(u: exp.Unnest, has_multi_expr: bool) -> t.Type[exp.Func]:
+        if u.args.get("offset"):
+            return exp.Posexplode
+        return exp.Inline if has_multi_expr else exp.Explode
+
     if isinstance(expression, exp.Select):
-        for join in expression.args.get("joins") or []:
-            unnest = join.this
+        from_ = expression.args.get("from_")
+
+        if from_ and isinstance(from_.this, exp.Unnest):
+            unnest = from_.this
+            alias = unnest.args.get("alias")
+            exprs = unnest.expressions
+            has_multi_expr = len(exprs) > 1
+            this, *_ = _unnest_zip_exprs(unnest, exprs, has_multi_expr)
+
+            columns = alias.columns if alias else []
+            offset = unnest.args.get("offset")
+            if offset:
+                columns.insert(
+                    0, offset if isinstance(offset, exp.Identifier) else exp.to_identifier("pos")
+                )
+
+            unnest.replace(
+                exp.Table(
+                    this=_udtf_type(unnest, has_multi_expr)(this=this),
+                    alias=exp.TableAlias(this=alias.this, columns=columns) if alias else None,
+                )
+            )
+
+        joins = expression.args.get("joins") or []
+        for join in list(joins):
+            join_expr = join.this
+
+            is_lateral = isinstance(join_expr, exp.Lateral)
+
+            unnest = join_expr.this if is_lateral else join_expr
 
             if isinstance(unnest, exp.Unnest):
-                alias = unnest.args.get("alias")
-                udtf = exp.Posexplode if unnest.args.get("offset") else exp.Explode
+                if is_lateral:
+                    alias = join_expr.args.get("alias")
+                else:
+                    alias = unnest.args.get("alias")
+                exprs = unnest.expressions
+                # The number of unnest.expressions will be changed by _unnest_zip_exprs, we need to record it here
+                has_multi_expr = len(exprs) > 1
+                exprs = _unnest_zip_exprs(unnest, exprs, has_multi_expr)
 
-                expression.args["joins"].remove(join)
+                joins.remove(join)
 
-                for e, column in zip(unnest.expressions, alias.columns if alias else []):
+                alias_cols = alias.columns if alias else []
+
+                # # Handle UNNEST to LATERAL VIEW EXPLODE: Exception is raised when there are 0 or > 2 aliases
+                # Spark LATERAL VIEW EXPLODE requires single alias for array/struct and two for Map type column unlike unnest in trino/presto which can take an arbitrary amount.
+                # Refs: https://spark.apache.org/docs/latest/sql-ref-syntax-qry-select-lateral-view.html
+
+                if not has_multi_expr and len(alias_cols) not in (1, 2):
+                    raise UnsupportedError(
+                        "CROSS JOIN UNNEST to LATERAL VIEW EXPLODE transformation requires explicit column aliases"
+                    )
+
+                offset = unnest.args.get("offset")
+                if offset:
+                    alias_cols.insert(
+                        0,
+                        offset if isinstance(offset, exp.Identifier) else exp.to_identifier("pos"),
+                    )
+
+                for e, column in zip(exprs, alias_cols):
                     expression.append(
                         "laterals",
                         exp.Lateral(
-                            this=udtf(this=e),
+                            this=_udtf_type(unnest, has_multi_expr)(this=e),
                             view=True,
-                            alias=exp.TableAlias(this=alias.this, columns=[column]),  # type: ignore
+                            alias=exp.TableAlias(
+                                this=alias.this,  # type: ignore
+                                columns=alias_cols,
+                            ),
                         ),
                     )
 
     return expression
 
 
-def explode_to_unnest(index_offset: int = 0) -> t.Callable[[exp.Expression], exp.Expression]:
-    """Convert explode/posexplode into unnest."""
+def explode_projection_to_unnest(
+    index_offset: int = 0,
+) -> t.Callable[[exp.Expression], exp.Expression]:
+    """Convert explode/posexplode projections into unnests."""
 
-    def _explode_to_unnest(expression: exp.Expression) -> exp.Expression:
+    def _explode_projection_to_unnest(expression: exp.Expression) -> exp.Expression:
         if isinstance(expression, exp.Select):
             from sqlglot.optimizer.scope import Scope
 
@@ -300,7 +495,7 @@ def explode_to_unnest(index_offset: int = 0) -> t.Callable[[exp.Expression], exp
                         expression.set("expressions", expressions)
 
                     if not arrays:
-                        if expression.args.get("from"):
+                        if expression.args.get("from_"):
                             expression.join(series, copy=False, join_type="CROSS")
                         else:
                             expression.from_(series, copy=False)
@@ -346,7 +541,7 @@ def explode_to_unnest(index_offset: int = 0) -> t.Callable[[exp.Expression], exp
 
         return expression
 
-    return _explode_to_unnest
+    return _explode_projection_to_unnest
 
 
 def add_within_group_for_percentiles(expression: exp.Expression) -> exp.Expression:
@@ -386,7 +581,7 @@ def add_recursive_cte_column_names(expression: exp.Expression) -> exp.Expression
         for cte in expression.expressions:
             if not cte.args["alias"].columns:
                 query = cte.this
-                if isinstance(query, exp.Union):
+                if isinstance(query, exp.SetOperation):
                     query = query.this
 
                 cte.args["alias"].set(
@@ -443,16 +638,30 @@ def eliminate_full_outer_join(expression: exp.Expression) -> exp.Expression:
             expression_copy = expression.copy()
             expression.set("limit", None)
             index, full_outer_join = full_outer_joins[0]
-            full_outer_join.set("side", "left")
-            expression_copy.args["joins"][index].set("side", "right")
-            expression_copy.args.pop("with", None)  # remove CTEs from RIGHT side
 
-            return exp.union(expression, expression_copy, copy=False)
+            tables = (expression.args["from_"].alias_or_name, full_outer_join.alias_or_name)
+            join_conditions = full_outer_join.args.get("on") or exp.and_(
+                *[
+                    exp.column(col, tables[0]).eq(exp.column(col, tables[1]))
+                    for col in full_outer_join.args.get("using")
+                ]
+            )
+
+            full_outer_join.set("side", "left")
+            anti_join_clause = (
+                exp.select("1").from_(expression.args["from_"]).where(join_conditions)
+            )
+            expression_copy.args["joins"][index].set("side", "right")
+            expression_copy = expression_copy.where(exp.Exists(this=anti_join_clause).not_())
+            expression_copy.set("with_", None)  # remove CTEs from RIGHT side
+            expression.set("order", None)  # remove order by from LEFT side
+
+            return exp.union(expression, expression_copy, copy=False, distinct=False)
 
     return expression
 
 
-def move_ctes_to_top_level(expression: exp.Expression) -> exp.Expression:
+def move_ctes_to_top_level(expression: E) -> E:
     """
     Some dialects (e.g. Hive, T-SQL, Spark prior to version 3) only allow CTEs to be
     defined at the top-level, so for example queries like:
@@ -464,20 +673,29 @@ def move_ctes_to_top_level(expression: exp.Expression) -> exp.Expression:
 
     TODO: handle name clashes whilst moving CTEs (it can get quite tricky & costly).
     """
-    top_level_with = expression.args.get("with")
-    for node in expression.find_all(exp.With):
-        if node.parent is expression:
+    top_level_with = expression.args.get("with_")
+    for inner_with in expression.find_all(exp.With):
+        if inner_with.parent is expression:
             continue
 
-        inner_with = node.pop()
         if not top_level_with:
-            top_level_with = inner_with
-            expression.set("with", top_level_with)
+            top_level_with = inner_with.pop()
+            expression.set("with_", top_level_with)
         else:
             if inner_with.recursive:
                 top_level_with.set("recursive", True)
 
-            top_level_with.set("expressions", inner_with.expressions + top_level_with.expressions)
+            parent_cte = inner_with.find_ancestor(exp.CTE)
+            inner_with.pop()
+
+            if parent_cte:
+                i = top_level_with.expressions.index(parent_cte)
+                top_level_with.expressions[i:i] = inner_with.expressions
+                top_level_with.set("expressions", top_level_with.expressions)
+            else:
+                top_level_with.set(
+                    "expressions", top_level_with.expressions + inner_with.expressions
+                )
 
     return expression
 
@@ -489,7 +707,10 @@ def ensure_bools(expression: exp.Expression) -> exp.Expression:
     def _ensure_bool(node: exp.Expression) -> None:
         if (
             node.is_number
-            or node.is_type(exp.DataType.Type.UNKNOWN, *exp.DataType.NUMERIC_TYPES)
+            or (
+                not isinstance(node, exp.SubqueryPredicate)
+                and node.is_type(exp.DataType.Type.UNKNOWN, *exp.DataType.NUMERIC_TYPES)
+            )
             or (isinstance(node, exp.Column) and not node.type)
         ):
             node.replace(node.neq(0))
@@ -604,47 +825,232 @@ def struct_kv_to_alias(expression: exp.Expression) -> exp.Expression:
     return expression
 
 
-def preprocess(
-    transforms: t.List[t.Callable[[exp.Expression], exp.Expression]],
-) -> t.Callable[[Generator, exp.Expression], str]:
+def eliminate_join_marks(expression: exp.Expression) -> exp.Expression:
+    """https://docs.oracle.com/cd/B19306_01/server.102/b14200/queries006.htm#sthref3178
+
+    1. You cannot specify the (+) operator in a query block that also contains FROM clause join syntax.
+
+    2. The (+) operator can appear only in the WHERE clause or, in the context of left-correlation (that is, when specifying the TABLE clause) in the FROM clause, and can be applied only to a column of a table or view.
+
+    The (+) operator does not produce an outer join if you specify one table in the outer query and the other table in an inner query.
+
+    You cannot use the (+) operator to outer-join a table to itself, although self joins are valid.
+
+    The (+) operator can be applied only to a column, not to an arbitrary expression. However, an arbitrary expression can contain one or more columns marked with the (+) operator.
+
+    A WHERE condition containing the (+) operator cannot be combined with another condition using the OR logical operator.
+
+    A WHERE condition cannot use the IN comparison condition to compare a column marked with the (+) operator with an expression.
+
+    A WHERE condition cannot compare any column marked with the (+) operator with a subquery.
+
+    -- example with WHERE
+    SELECT d.department_name, sum(e.salary) as total_salary
+    FROM departments d, employees e
+    WHERE e.department_id(+) = d.department_id
+    group by department_name
+
+    -- example of left correlation in select
+    SELECT d.department_name, (
+        SELECT SUM(e.salary)
+            FROM employees e
+            WHERE e.department_id(+) = d.department_id) AS total_salary
+    FROM departments d;
+
+    -- example of left correlation in from
+    SELECT d.department_name, t.total_salary
+    FROM departments d, (
+            SELECT SUM(e.salary) AS total_salary
+            FROM employees e
+            WHERE e.department_id(+) = d.department_id
+        ) t
     """
-    Creates a new transform by chaining a sequence of transformations and converts the resulting
-    expression to SQL, using either the "_sql" method corresponding to the resulting expression,
-    or the appropriate `Generator.TRANSFORMS` function (when applicable -- see below).
+
+    from sqlglot.optimizer.scope import traverse_scope
+    from sqlglot.optimizer.normalize import normalize, normalized
+    from collections import defaultdict
+
+    # we go in reverse to check the main query for left correlation
+    for scope in reversed(traverse_scope(expression)):
+        query = scope.expression
+
+        where = query.args.get("where")
+        joins = query.args.get("joins", [])
+
+        if not where or not any(c.args.get("join_mark") for c in where.find_all(exp.Column)):
+            continue
+
+        # knockout: we do not support left correlation (see point 2)
+        assert not scope.is_correlated_subquery, "Correlated queries are not supported"
+
+        # make sure we have AND of ORs to have clear join terms
+        where = normalize(where.this)
+        assert normalized(where), "Cannot normalize JOIN predicates"
+
+        joins_ons = defaultdict(list)  # dict of {name: list of join AND conditions}
+        for cond in [where] if not isinstance(where, exp.And) else where.flatten():
+            join_cols = [col for col in cond.find_all(exp.Column) if col.args.get("join_mark")]
+
+            left_join_table = set(col.table for col in join_cols)
+            if not left_join_table:
+                continue
+
+            assert not (
+                len(left_join_table) > 1
+            ), "Cannot combine JOIN predicates from different tables"
+
+            for col in join_cols:
+                col.set("join_mark", False)
+
+            joins_ons[left_join_table.pop()].append(cond)
+
+        old_joins = {join.alias_or_name: join for join in joins}
+        new_joins = {}
+        query_from = query.args["from_"]
+
+        for table, predicates in joins_ons.items():
+            join_what = old_joins.get(table, query_from).this.copy()
+            new_joins[join_what.alias_or_name] = exp.Join(
+                this=join_what, on=exp.and_(*predicates), kind="LEFT"
+            )
+
+            for p in predicates:
+                while isinstance(p.parent, exp.Paren):
+                    p.parent.replace(p)
+
+                parent = p.parent
+                p.pop()
+                if isinstance(parent, exp.Binary):
+                    parent.replace(parent.right if parent.left is None else parent.left)
+                elif isinstance(parent, exp.Where):
+                    parent.pop()
+
+        if query_from.alias_or_name in new_joins:
+            only_old_joins = old_joins.keys() - new_joins.keys()
+            assert (
+                len(only_old_joins) >= 1
+            ), "Cannot determine which table to use in the new FROM clause"
+
+            new_from_name = list(only_old_joins)[0]
+            query.set("from_", exp.From(this=old_joins[new_from_name].this))
+
+        if new_joins:
+            for n, j in old_joins.items():  # preserve any other joins
+                if n not in new_joins and n != query.args["from_"].name:
+                    if not j.kind:
+                        j.set("kind", "CROSS")
+                    new_joins[n] = j
+            query.set("joins", list(new_joins.values()))
+
+    return expression
+
+
+def any_to_exists(expression: exp.Expression) -> exp.Expression:
+    """
+    Transform ANY operator to Spark's EXISTS
+
+    For example,
+        - Postgres: SELECT * FROM tbl WHERE 5 > ANY(tbl.col)
+        - Spark: SELECT * FROM tbl WHERE EXISTS(tbl.col, x -> x < 5)
+
+    Both ANY and EXISTS accept queries but currently only array expressions are supported for this
+    transformation
+    """
+    if isinstance(expression, exp.Select):
+        for any_expr in expression.find_all(exp.Any):
+            this = any_expr.this
+            if isinstance(this, exp.Query) or isinstance(any_expr.parent, (exp.Like, exp.ILike)):
+                continue
+
+            binop = any_expr.parent
+            if isinstance(binop, exp.Binary):
+                lambda_arg = exp.to_identifier("x")
+                any_expr.replace(lambda_arg)
+                lambda_expr = exp.Lambda(this=binop.copy(), expressions=[lambda_arg])
+                binop.replace(exp.Exists(this=this.unnest(), expression=lambda_expr))
+
+    return expression
+
+
+def eliminate_window_clause(expression: exp.Expression) -> exp.Expression:
+    """Eliminates the `WINDOW` query clause by inling each named window."""
+    if isinstance(expression, exp.Select) and expression.args.get("windows"):
+        from sqlglot.optimizer.scope import find_all_in_scope
+
+        windows = expression.args["windows"]
+        expression.set("windows", None)
+
+        window_expression: t.Dict[str, exp.Expression] = {}
+
+        def _inline_inherited_window(window: exp.Expression) -> None:
+            inherited_window = window_expression.get(window.alias.lower())
+            if not inherited_window:
+                return
+
+            window.set("alias", None)
+            for key in ("partition_by", "order", "spec"):
+                arg = inherited_window.args.get(key)
+                if arg:
+                    window.set(key, arg.copy())
+
+        for window in windows:
+            _inline_inherited_window(window)
+            window_expression[window.name.lower()] = window
+
+        for window in find_all_in_scope(expression, exp.Window):
+            _inline_inherited_window(window)
+
+    return expression
+
+
+def inherit_struct_field_names(expression: exp.Expression) -> exp.Expression:
+    """
+    Inherit field names from the first struct in an array.
+
+    BigQuery supports implicitly inheriting names from the first STRUCT in an array:
+
+    Example:
+        ARRAY[
+          STRUCT('Alice' AS name, 85 AS score),  -- defines names
+          STRUCT('Bob', 92),                     -- inherits names
+          STRUCT('Diana', 95)                    -- inherits names
+        ]
+
+    This transformation makes the field names explicit on all structs by adding
+    PropertyEQ nodes, in order to facilitate transpilation to other dialects.
 
     Args:
-        transforms: sequence of transform functions. These will be called in order.
+        expression: The expression tree to transform
 
     Returns:
-        Function that can be used as a generator transform.
+        The modified expression with field names inherited in all structs
     """
+    if (
+        isinstance(expression, exp.Array)
+        and expression.args.get("struct_name_inheritance")
+        and isinstance(first_item := seq_get(expression.expressions, 0), exp.Struct)
+        and all(isinstance(fld, exp.PropertyEQ) for fld in first_item.expressions)
+    ):
+        field_names = [fld.this for fld in first_item.expressions]
 
-    def _to_sql(self, expression: exp.Expression) -> str:
-        expression_type = type(expression)
+        # Apply field names to subsequent structs that don't have them
+        for struct in expression.expressions[1:]:
+            if not isinstance(struct, exp.Struct) or len(struct.expressions) != len(field_names):
+                continue
 
-        expression = transforms[0](expression)
-        for transform in transforms[1:]:
-            expression = transform(expression)
+            # Convert unnamed expressions to PropertyEQ with inherited names
+            new_expressions = []
+            for i, expr in enumerate(struct.expressions):
+                if not isinstance(expr, exp.PropertyEQ):
+                    # Create PropertyEQ: field_name := value
+                    new_expressions.append(
+                        exp.PropertyEQ(
+                            this=exp.Identifier(this=field_names[i].copy()), expression=expr
+                        )
+                    )
+                else:
+                    new_expressions.append(expr)
 
-        _sql_handler = getattr(self, expression.key + "_sql", None)
-        if _sql_handler:
-            return _sql_handler(expression)
+            struct.set("expressions", new_expressions)
 
-        transforms_handler = self.TRANSFORMS.get(type(expression))
-        if transforms_handler:
-            if expression_type is type(expression):
-                if isinstance(expression, exp.Func):
-                    return self.function_fallback_sql(expression)
-
-                # Ensures we don't enter an infinite loop. This can happen when the original expression
-                # has the same type as the final expression and there's no _sql method available for it,
-                # because then it'd re-enter _to_sql.
-                raise ValueError(
-                    f"Expression type {expression.__class__.__name__} requires a _sql method in order to be transformed."
-                )
-
-            return transforms_handler(self, expression)
-
-        raise ValueError(f"Unsupported expression type {expression.__class__.__name__}.")
-
-    return _to_sql
+    return expression

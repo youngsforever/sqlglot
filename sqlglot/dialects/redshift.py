@@ -12,10 +12,12 @@ from sqlglot.dialects.dialect import (
     json_extract_segments,
     no_tablesample_sql,
     rename_func,
+    map_date_part,
 )
 from sqlglot.dialects.postgres import Postgres
 from sqlglot.helper import seq_get
 from sqlglot.tokens import TokenType
+from sqlglot.parser import build_convert_timezone
 
 if t.TYPE_CHECKING:
     from sqlglot._typing import E
@@ -23,7 +25,11 @@ if t.TYPE_CHECKING:
 
 def _build_date_delta(expr_type: t.Type[E]) -> t.Callable[[t.List], E]:
     def _builder(args: t.List) -> E:
-        expr = expr_type(this=seq_get(args, 2), expression=seq_get(args, 1), unit=seq_get(args, 0))
+        expr = expr_type(
+            this=seq_get(args, 2),
+            expression=seq_get(args, 1),
+            unit=map_date_part(seq_get(args, 0)),
+        )
         if expr_type is exp.TsOrDsAdd:
             expr.set("return_type", exp.DataType.build("TIMESTAMP"))
 
@@ -39,13 +45,14 @@ class Redshift(Postgres):
     SUPPORTS_USER_DEFINED_TYPES = False
     INDEX_OFFSET = 0
     COPY_PARAMS_ARE_CSV = False
+    HEX_LOWERCASE = True
+    HAS_DISTINCT_ARRAY_CONSTRUCTORS = True
+    COALESCE_COMPARISON_NON_STANDARD = True
+    REGEXP_EXTRACT_POSITION_OVERFLOW_RETURNS_NULL = False
 
-    TIME_FORMAT = "'YYYY-MM-DD HH:MI:SS'"
-    TIME_MAPPING = {
-        **Postgres.TIME_MAPPING,
-        "MON": "%b",
-        "HH": "%H",
-    }
+    # ref: https://docs.aws.amazon.com/redshift/latest/dg/r_FORMAT_strings.html
+    TIME_FORMAT = "'YYYY-MM-DD HH24:MI:SS'"
+    TIME_MAPPING = {**Postgres.TIME_MAPPING, "MON": "%b", "HH24": "%H", "HH": "%I"}
 
     class Parser(Postgres.Parser):
         FUNCTIONS = {
@@ -56,19 +63,31 @@ class Redshift(Postgres):
                 unit=exp.var("month"),
                 return_type=exp.DataType.build("TIMESTAMP"),
             ),
+            "CONVERT_TIMEZONE": lambda args: build_convert_timezone(args, "UTC"),
             "DATEADD": _build_date_delta(exp.TsOrDsAdd),
             "DATE_ADD": _build_date_delta(exp.TsOrDsAdd),
             "DATEDIFF": _build_date_delta(exp.TsOrDsDiff),
             "DATE_DIFF": _build_date_delta(exp.TsOrDsDiff),
             "GETDATE": exp.CurrentTimestamp.from_arg_list,
             "LISTAGG": exp.GroupConcat.from_arg_list,
+            "REGEXP_SUBSTR": lambda args: exp.RegexpExtract(
+                this=seq_get(args, 0),
+                expression=seq_get(args, 1),
+                position=seq_get(args, 2),
+                occurrence=seq_get(args, 3),
+                parameters=seq_get(args, 4),
+            ),
+            "SPLIT_TO_ARRAY": lambda args: exp.StringToArray(
+                this=seq_get(args, 0), expression=seq_get(args, 1) or exp.Literal.string(",")
+            ),
             "STRTOL": exp.FromBase.from_arg_list,
         }
+        FUNCTIONS.pop("GET_BIT")
 
         NO_PAREN_FUNCTION_PARSERS = {
             **Postgres.Parser.NO_PAREN_FUNCTION_PARSERS,
             "APPROXIMATE": lambda self: self._parse_approximate_count(),
-            "SYSDATE": lambda self: self.expression(exp.CurrentTimestamp, transaction=True),
+            "SYSDATE": lambda self: self.expression(exp.CurrentTimestamp, sysdate=True),
         }
 
         SUPPORTS_IMPLICIT_UNNEST = True
@@ -81,6 +100,7 @@ class Redshift(Postgres):
             parse_bracket: bool = False,
             is_db_reference: bool = False,
             parse_partition: bool = False,
+            consume_pipe: bool = False,
         ) -> t.Optional[exp.Expression]:
             # Redshift supports UNPIVOTing SUPER objects, e.g. `UNPIVOT foo.obj[0] AS val AT attr`
             unpivot = self._match(TokenType.UNPIVOT)
@@ -118,11 +138,14 @@ class Redshift(Postgres):
 
         KEYWORDS = {
             **Postgres.Tokenizer.KEYWORDS,
+            "(+)": TokenType.JOIN_MARKER,
             "HLLSKETCH": TokenType.HLLSKETCH,
+            "MINUS": TokenType.EXCEPT,
             "SUPER": TokenType.SUPER,
             "TOP": TokenType.TOP,
             "UNLOAD": TokenType.COMMAND,
             "VARBYTE": TokenType.VARBINARY,
+            "BINARY VARYING": TokenType.VARBINARY,
         }
         KEYWORDS.pop("VALUES")
 
@@ -140,10 +163,24 @@ class Redshift(Postgres):
         CAN_IMPLEMENT_ARRAY_ANY = False
         MULTI_ARG_DISTINCT = True
         COPY_PARAMS_ARE_WRAPPED = False
+        HEX_FUNC = "TO_HEX"
+        PARSE_JSON_NAME = "JSON_PARSE"
+        ARRAY_CONCAT_IS_VAR_LEN = False
+        SUPPORTS_CONVERT_TIMEZONE = True
+        EXCEPT_INTERSECT_SUPPORT_ALL_CLAUSE = False
+        SUPPORTS_MEDIAN = True
+        ALTER_SET_TYPE = "TYPE"
+        SUPPORTS_DECODE_CASE = True
+        SUPPORTS_BETWEEN_FLAGS = False
+        LIMIT_FETCH = "LIMIT"
+
+        # Redshift doesn't have `WITH` as part of their with_properties so we remove it
+        WITH_PROPERTIES_PREFIX = " "
 
         TYPE_MAPPING = {
             **Postgres.Generator.TYPE_MAPPING,
             exp.DataType.Type.BINARY: "VARBYTE",
+            exp.DataType.Type.BLOB: "VARBYTE",
             exp.DataType.Type.INT: "INTEGER",
             exp.DataType.Type.TIMETZ: "TIME",
             exp.DataType.Type.TIMESTAMPTZ: "TIMESTAMP",
@@ -153,52 +190,66 @@ class Redshift(Postgres):
 
         TRANSFORMS = {
             **Postgres.Generator.TRANSFORMS,
+            exp.ArrayConcat: lambda self, e: self.arrayconcat_sql(e, name="ARRAY_CONCAT"),
             exp.Concat: concat_to_dpipe_sql,
             exp.ConcatWs: concat_ws_to_dpipe_sql,
             exp.ApproxDistinct: lambda self,
             e: f"APPROXIMATE COUNT(DISTINCT {self.sql(e, 'this')})",
             exp.CurrentTimestamp: lambda self, e: (
-                "SYSDATE" if e.args.get("transaction") else "GETDATE()"
+                "SYSDATE" if e.args.get("sysdate") else "GETDATE()"
             ),
             exp.DateAdd: date_delta_sql("DATEADD"),
             exp.DateDiff: date_delta_sql("DATEDIFF"),
             exp.DistKeyProperty: lambda self, e: self.func("DISTKEY", e.this),
             exp.DistStyleProperty: lambda self, e: self.naked_property(e),
+            exp.Explode: lambda self, e: self.explode_sql(e),
+            exp.FarmFingerprint: rename_func("FARMFINGERPRINT64"),
             exp.FromBase: rename_func("STRTOL"),
             exp.GeneratedAsIdentityColumnConstraint: generatedasidentitycolumnconstraint_sql,
             exp.JSONExtract: json_extract_segments("JSON_EXTRACT_PATH_TEXT"),
             exp.JSONExtractScalar: json_extract_segments("JSON_EXTRACT_PATH_TEXT"),
             exp.GroupConcat: rename_func("LISTAGG"),
-            exp.ParseJSON: rename_func("JSON_PARSE"),
+            exp.Hex: lambda self, e: self.func("UPPER", self.func("TO_HEX", self.sql(e, "this"))),
+            exp.RegexpExtract: rename_func("REGEXP_SUBSTR"),
             exp.Select: transforms.preprocess(
                 [
+                    transforms.eliminate_window_clause,
                     transforms.eliminate_distinct_on,
                     transforms.eliminate_semi_and_anti_joins,
                     transforms.unqualify_unnest,
+                    transforms.unnest_generate_date_array_using_recursive_cte,
                 ]
             ),
             exp.SortKeyProperty: lambda self,
             e: f"{'COMPOUND ' if e.args['compound'] else ''}SORTKEY({self.format_args(*e.this)})",
             exp.StartsWith: lambda self,
             e: f"{self.sql(e.this)} LIKE {self.sql(e.expression)} || '%'",
+            exp.StringToArray: rename_func("SPLIT_TO_ARRAY"),
             exp.TableSample: no_tablesample_sql,
             exp.TsOrDsAdd: date_delta_sql("DATEADD"),
             exp.TsOrDsDiff: date_delta_sql("DATEDIFF"),
-            exp.UnixToTime: lambda self,
-            e: f"(TIMESTAMP 'epoch' + {self.sql(e.this)} * INTERVAL '1 SECOND')",
+            exp.UnixToTime: lambda self, e: self._unix_to_time_sql(e),
+            exp.SHA2Digest: lambda self, e: self.func(
+                "SHA2", e.this, e.args.get("length") or exp.Literal.number(256)
+            ),
         }
 
         # Postgres maps exp.Pivot to no_pivot_sql, but Redshift support pivots
         TRANSFORMS.pop(exp.Pivot)
 
-        # Redshift uses the POW | POWER (expr1, expr2) syntax instead of expr1 ^ expr2 (postgres)
-        TRANSFORMS.pop(exp.Pow)
+        # Postgres doesn't support JSON_PARSE, but Redshift does
+        TRANSFORMS.pop(exp.ParseJSON)
 
-        # Redshift supports ANY_VALUE(..)
+        # Redshift supports these functions
         TRANSFORMS.pop(exp.AnyValue)
-
-        # Redshift supports LAST_DAY(..)
         TRANSFORMS.pop(exp.LastDay)
+        TRANSFORMS.pop(exp.SHA2)
+
+        # Postgres and Redshift have different semantics for Getbit
+        TRANSFORMS.pop(exp.Getbit)
+
+        # Postgres does not permit a double precision argument in ROUND; Redshift does
+        TRANSFORMS.pop(exp.Round)
 
         RESERVED_KEYWORDS = {
             "aes128",
@@ -364,17 +415,18 @@ class Redshift(Postgres):
             args = expression.expressions
             num_args = len(args)
 
-            if num_args > 1:
+            if num_args != 1:
                 self.unsupported(f"Unsupported number of arguments in UNNEST: {num_args}")
                 return ""
 
+            if isinstance(expression.find_ancestor(exp.From, exp.Join, exp.Select), exp.Select):
+                self.unsupported("Unsupported UNNEST when not used in FROM/JOIN clauses")
+                return ""
+
             arg = self.sql(seq_get(args, 0))
+
             alias = self.expressions(expression.args.get("alias"), key="columns", flat=True)
             return f"{arg} AS {alias}" if alias else arg
-
-        def with_properties(self, properties: exp.Properties) -> str:
-            """Redshift doesn't have `WITH` as part of their with_properties so we remove it"""
-            return self.properties(properties, prefix=" ", suffix="")
 
         def cast_sql(self, expression: exp.Cast, safe_prefix: t.Optional[str] = None) -> str:
             if expression.is_type(exp.DataType.Type.JSON):
@@ -398,3 +450,32 @@ class Redshift(Postgres):
                     expression.append("expressions", exp.var("MAX"))
 
             return super().datatype_sql(expression)
+
+        def alterset_sql(self, expression: exp.AlterSet) -> str:
+            exprs = self.expressions(expression, flat=True)
+            exprs = f" TABLE PROPERTIES ({exprs})" if exprs else ""
+            location = self.sql(expression, "location")
+            location = f" LOCATION {location}" if location else ""
+            file_format = self.expressions(expression, key="file_format", flat=True, sep=" ")
+            file_format = f" FILE FORMAT {file_format}" if file_format else ""
+
+            return f"SET{exprs}{location}{file_format}"
+
+        def array_sql(self, expression: exp.Array) -> str:
+            if expression.args.get("bracket_notation"):
+                return super().array_sql(expression)
+
+            return rename_func("ARRAY")(self, expression)
+
+        def explode_sql(self, expression: exp.Explode) -> str:
+            self.unsupported("Unsupported EXPLODE() function")
+            return ""
+
+        def _unix_to_time_sql(self, expression: exp.UnixToTime) -> str:
+            scale = expression.args.get("scale")
+            this = self.sql(expression.this)
+
+            if scale is not None and scale != exp.UnixToTime.SECONDS and scale.is_int:
+                this = f"({this} / POWER(10, {scale.to_py()}))"
+
+            return f"(TIMESTAMP 'epoch' + {this} * INTERVAL '1 SECOND')"

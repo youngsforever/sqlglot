@@ -36,6 +36,10 @@ class PRQL(Dialect):
         CONJUNCTION = {
             **parser.Parser.CONJUNCTION,
             TokenType.DAMP: exp.And,
+        }
+
+        DISJUNCTION = {
+            **parser.Parser.DISJUNCTION,
             TokenType.DPIPE: exp.Or,
         }
 
@@ -43,7 +47,7 @@ class PRQL(Dialect):
             "DERIVE": lambda self, query: self._parse_selection(query),
             "SELECT": lambda self, query: self._parse_selection(query, append=False),
             "TAKE": lambda self, query: self._parse_take(query),
-            "FILTER": lambda self, query: query.where(self._parse_conjunction()),
+            "FILTER": lambda self, query: query.where(self._parse_disjunction()),
             "APPEND": lambda self, query: query.union(
                 _select_all(self._parse_table()), distinct=False, copy=False
             ),
@@ -174,8 +178,8 @@ class PRQL(Dialect):
             if self._next and self._next.token_type == TokenType.ALIAS:
                 alias = self._parse_id_var(True)
                 self._match(TokenType.ALIAS)
-                return self.expression(exp.Alias, this=self._parse_conjunction(), alias=alias)
-            return self._parse_conjunction()
+                return self.expression(exp.Alias, this=self._parse_assignment(), alias=alias)
+            return self._parse_assignment()
 
         def _parse_table(
             self,
@@ -185,11 +189,15 @@ class PRQL(Dialect):
             parse_bracket: bool = False,
             is_db_reference: bool = False,
             parse_partition: bool = False,
+            consume_pipe: bool = False,
         ) -> t.Optional[exp.Expression]:
             return self._parse_table_parts()
 
         def _parse_from(
-            self, joins: bool = False, skip_from_token: bool = False
+            self,
+            joins: bool = False,
+            skip_from_token: bool = False,
+            consume_pipe: bool = False,
         ) -> t.Optional[exp.From]:
             if not skip_from_token and not self._match(TokenType.FROM):
                 return None

@@ -33,7 +33,7 @@ FROM (
          WHERE object_pointstext IS NOT NULL
      );
 CREATE OR REPLACE TEMPORARY VIEW `latest_boo` AS
-WITH `_q_1` AS (
+WITH `_1` AS (
   SELECT
     EXPLODE_OUTER(SPLIT(`boo`.`object_pointstext`, ',')) AS `points`
   FROM `boo` AS `boo`
@@ -41,9 +41,9 @@ WITH `_q_1` AS (
     NOT `boo`.`object_pointstext` IS NULL
 )
 SELECT
-  TRIM(SPLIT(`_q_1`.`points`, ':')[0]) AS `points_type`,
-  TRIM(SPLIT(`_q_1`.`points`, ':')[1]) AS `points_value`
-FROM `_q_1` AS `_q_1`;
+  TRIM(SPLIT(`_1`.`points`, ':')[0]) AS `points_type`,
+  TRIM(SPLIT(`_1`.`points`, ':')[1]) AS `points_value`
+FROM `_1` AS `_1`;
 
 # title: Union in CTE
 WITH cte AS (
@@ -131,10 +131,10 @@ SELECT
   "x"."a" AS "a",
   SUM("y"."b") AS "sum_b"
 FROM "x" AS "x"
-LEFT JOIN "_u_0" AS "_u_0"
-  ON "_u_0"."_u_1" = "x"."b"
 JOIN "y" AS "y"
   ON "x"."b" = "y"."b"
+LEFT JOIN "_u_0" AS "_u_0"
+  ON "_u_0"."_u_1" = "x"."b"
 WHERE
   "_u_0"."_col_0" >= 0 AND "x"."a" > 1
 GROUP BY
@@ -240,10 +240,10 @@ SELECT
   "n"."b" AS "b",
   "o"."b" AS "b"
 FROM "n" AS "n"
-JOIN "n" AS "n2"
-  ON "n"."a" = "n2"."a"
 FULL JOIN "o" AS "o"
   ON "n"."a" = "o"."a"
+JOIN "n" AS "n2"
+  ON "n"."a" = "n2"."a"
 WHERE
   "o"."b" > 0;
 
@@ -472,17 +472,22 @@ FROM (
       alias_1.id = alias_2.id
     )
 ) AS main_query;
+WITH "alias_2" AS (
+  SELECT
+    "company_table_2"."id" AS "id"
+  FROM "company_table" AS "company_table_2"
+  LEFT JOIN "unlocked" AS "unlocked"
+    ON "company_table_2"."id" = "unlocked"."company_id"
+  WHERE
+    CASE WHEN "unlocked"."company_id" IS NULL THEN 0 ELSE 1 END = FALSE
+    AND NOT "company_table_2"."id" IS NULL
+)
 SELECT
   "company_table"."id" AS "id",
   "company_table"."score" AS "score"
 FROM "company_table" AS "company_table"
-JOIN "company_table" AS "company_table_2"
-  ON "company_table"."id" = "company_table_2"."id"
-LEFT JOIN "unlocked" AS "unlocked"
-  ON "company_table_2"."id" = "unlocked"."company_id"
-WHERE
-  CASE WHEN "unlocked"."company_id" IS NULL THEN 0 ELSE 1 END = FALSE
-  AND NOT "company_table_2"."id" IS NULL;
+JOIN "alias_2" AS "alias_2"
+  ON "alias_2"."id" = "company_table"."id";
 
 # title: db.table alias clash
 # execute: false
@@ -531,55 +536,61 @@ FROM "unioned" AS "unioned"
 WHERE
   "unioned"."source_system" = 'bamboohr' OR "unioned"."source_system" = 'workday'
 QUALIFY
-  ROW_NUMBER() OVER (PARTITION BY "unioned"."unique_filter_key" ORDER BY "unioned"."sort_order" DESC, 1) = 1;
+  ROW_NUMBER() OVER (
+    PARTITION BY "unioned"."unique_filter_key"
+    ORDER BY "unioned"."sort_order" DESC, 1
+  ) = 1;
 
 # title: pivoted source with explicit selections
 # execute: false
 SELECT * FROM (SELECT a, b, c FROM sc.tb) PIVOT (SUM(c) FOR b IN ('x','y','z'));
 SELECT
-  "_q_1"."a" AS "a",
-  "_q_1"."x" AS "x",
-  "_q_1"."y" AS "y",
-  "_q_1"."z" AS "z"
+  "_1"."a" AS "a",
+  "_1"."x" AS "x",
+  "_1"."y" AS "y",
+  "_1"."z" AS "z"
 FROM (
   SELECT
     "tb"."a" AS "a",
     "tb"."b" AS "b",
     "tb"."c" AS "c"
   FROM "sc"."tb" AS "tb"
-) AS "_q_0" PIVOT(SUM("_q_0"."c") FOR "_q_0"."b" IN ('x', 'y', 'z')) AS "_q_1";
+) AS "_0"
+PIVOT(SUM("_0"."c") FOR "_0"."b" IN ('x', 'y', 'z')) AS "_1";
 
 # title: pivoted source with explicit selections where one of them is excluded & selected at the same time
 # note: we need to respect the exclude when selecting * from pivoted source and not include the computed column twice
 # execute: false
 SELECT * EXCEPT (x), CAST(x AS TEXT) AS x FROM (SELECT a, b, c FROM sc.tb) PIVOT (SUM(c) FOR b IN ('x','y','z'));
 SELECT
-  "_q_1"."a" AS "a",
-  "_q_1"."y" AS "y",
-  "_q_1"."z" AS "z",
-  CAST("_q_1"."x" AS TEXT) AS "x"
+  "_1"."a" AS "a",
+  "_1"."y" AS "y",
+  "_1"."z" AS "z",
+  CAST("_1"."x" AS TEXT) AS "x"
 FROM (
   SELECT
     "tb"."a" AS "a",
     "tb"."b" AS "b",
     "tb"."c" AS "c"
   FROM "sc"."tb" AS "tb"
-) AS "_q_0" PIVOT(SUM("_q_0"."c") FOR "_q_0"."b" IN ('x', 'y', 'z')) AS "_q_1";
+) AS "_0"
+PIVOT(SUM("_0"."c") FOR "_0"."b" IN ('x', 'y', 'z')) AS "_1";
 
 # title: pivoted source with implicit selections
 # execute: false
 SELECT * FROM (SELECT * FROM u) PIVOT (SUM(f) FOR h IN ('x', 'y'));
 SELECT
-  "_q_1"."g" AS "g",
-  "_q_1"."x" AS "x",
-  "_q_1"."y" AS "y"
+  "_1"."g" AS "g",
+  "_1"."x" AS "x",
+  "_1"."y" AS "y"
 FROM (
   SELECT
     "u"."f" AS "f",
     "u"."g" AS "g",
     "u"."h" AS "h"
   FROM "u" AS "u"
-) AS "_q_0" PIVOT(SUM("_q_0"."f") FOR "_q_0"."h" IN ('x', 'y')) AS "_q_1";
+) AS "_0"
+PIVOT(SUM("_0"."f") FOR "_0"."h" IN ('x', 'y')) AS "_1";
 
 # title: selecting explicit qualified columns from pivoted source with explicit selections
 # execute: false
@@ -592,15 +603,17 @@ FROM (
     "u"."f" AS "f",
     "u"."h" AS "h"
   FROM "u" AS "u"
-) AS "_q_0" PIVOT(SUM("_q_0"."f") FOR "_q_0"."h" IN ('x', 'y')) AS "piv";
+) AS "_0"
+PIVOT(SUM("_0"."f") FOR "_0"."h" IN ('x', 'y')) AS "piv";
 
 # title: selecting explicit unqualified columns from pivoted source with implicit selections
 # execute: false
 SELECT x, y FROM u PIVOT (SUM(f) FOR h IN ('x', 'y'));
 SELECT
-  "_q_0"."x" AS "x",
-  "_q_0"."y" AS "y"
-FROM "u" AS "u" PIVOT(SUM("u"."f") FOR "u"."h" IN ('x', 'y')) AS "_q_0";
+  "_0"."x" AS "x",
+  "_0"."y" AS "y"
+FROM "u" AS "u"
+PIVOT(SUM("u"."f") FOR "u"."h" IN ('x', 'y')) AS "_0";
 
 # title: selecting all columns from a pivoted CTE source, using alias for the aggregation and generating bigquery
 # execute: false
@@ -614,20 +627,22 @@ WITH `u_cte` AS (
   FROM `u` AS `u`
 )
 SELECT
-  `_q_0`.`g` AS `g`,
-  `_q_0`.`sum_x` AS `sum_x`,
-  `_q_0`.`sum_y` AS `sum_y`
-FROM `u_cte` AS `u_cte` PIVOT(SUM(`u_cte`.`f`) AS `sum` FOR `u_cte`.`h` IN ('x', 'y')) AS `_q_0`;
+  `_0`.`g` AS `g`,
+  `_0`.`sum_x` AS `sum_x`,
+  `_0`.`sum_y` AS `sum_y`
+FROM `u_cte` AS `u_cte`
+PIVOT(SUM(`u_cte`.`f`) AS `sum` FOR `u_cte`.`h` IN ('x', 'y')) AS `_0`;
 
 # title: selecting all columns from a pivoted source and generating snowflake
 # execute: false
 # dialect: snowflake
 SELECT * FROM u PIVOT (SUM(f) FOR h IN ('x', 'y'));
 SELECT
-  "_q_0"."G" AS "G",
-  "_q_0"."'x'" AS "'x'",
-  "_q_0"."'y'" AS "'y'"
-FROM "U" AS "U" PIVOT(SUM("U"."F") FOR "U"."H" IN ('x', 'y')) AS "_q_0";
+  "_0"."G" AS "G",
+  "_0"."'x'" AS "'x'",
+  "_0"."'y'" AS "'y'"
+FROM "U" AS "U"
+PIVOT(SUM("U"."F") FOR "U"."H" IN ('x', 'y')) AS "_0";
 
 # title: selecting all columns from a pivoted source and generating spark
 # note: spark doesn't allow pivot aliases or qualified columns for the pivot's "field" (`h`)
@@ -635,14 +650,15 @@ FROM "U" AS "U" PIVOT(SUM("U"."F") FOR "U"."H" IN ('x', 'y')) AS "_q_0";
 # dialect: spark
 SELECT * FROM u PIVOT (SUM(f) FOR h IN ('x', 'y'));
 SELECT
-  `_q_0`.`g` AS `g`,
-  `_q_0`.`x` AS `x`,
-  `_q_0`.`y` AS `y`
+  `_0`.`g` AS `g`,
+  `_0`.`x` AS `x`,
+  `_0`.`y` AS `y`
 FROM (
   SELECT
     *
-  FROM `u` AS `u` PIVOT(SUM(`u`.`f`) FOR `h` IN ('x', 'y'))
-) AS `_q_0`;
+  FROM `u` AS `u`
+  PIVOT(SUM(`u`.`f`) FOR `h` IN ('x', 'y'))
+) AS `_0`;
 
 # title: selecting all columns from a pivoted source, pivot has column aliases
 # execute: false
@@ -674,20 +690,22 @@ WITH "SOURCE" AS (
 SELECT
   "FINAL"."ID" AS "ID",
   "FINAL"."TIMESTAMP_1" AS "TIMESTAMP_1"
-FROM "SOURCE" AS "SOURCE" PIVOT(MAX("SOURCE"."VALUE") FOR "SOURCE"."KEY" IN ('a', 'b', 'c')) AS "FINAL"("ID", "TIMESTAMP_1", "TIMESTAMP_2", "COL_1", "COL_2", "COL_3");
+FROM "SOURCE" AS "SOURCE"
+PIVOT(MAX("SOURCE"."VALUE") FOR "SOURCE"."KEY" IN ('a', 'b', 'c')) AS "FINAL"("ID", "TIMESTAMP_1", "TIMESTAMP_2", "COL_1", "COL_2", "COL_3");
 
 # title: unpivoted table source with a single value column, unpivot columns can't be qualified
 # execute: false
 # dialect: snowflake
 SELECT * FROM m_sales AS m_sales(empid, dept, jan, feb) UNPIVOT(sales FOR month IN (jan, feb)) ORDER BY empid;
 SELECT
-  "_q_0"."EMPID" AS "EMPID",
-  "_q_0"."DEPT" AS "DEPT",
-  "_q_0"."MONTH" AS "MONTH",
-  "_q_0"."SALES" AS "SALES"
-FROM "M_SALES" AS "M_SALES"("EMPID", "DEPT", "JAN", "FEB") UNPIVOT("SALES" FOR "MONTH" IN ("JAN", "FEB")) AS "_q_0"
+  "M_SALES"."EMPID" AS "EMPID",
+  "M_SALES"."DEPT" AS "DEPT",
+  "M_SALES"."MONTH" AS "MONTH",
+  "M_SALES"."SALES" AS "SALES"
+FROM "M_SALES" AS "M_SALES"("EMPID", "DEPT", "JAN", "FEB")
+UNPIVOT("SALES" FOR "MONTH" IN ("JAN", "FEB")) AS "M_SALES"
 ORDER BY
-  "_q_0"."EMPID";
+  "M_SALES"."EMPID";
 
 # title: unpivoted table source, unpivot has column aliases
 # execute: false
@@ -704,17 +722,18 @@ FROM (
     "m_sales"."jan" AS "jan",
     "m_sales"."feb" AS "feb"
   FROM "m_sales" AS "m_sales"
-) AS "m_sales" UNPIVOT("sales" FOR "month" IN ("m_sales"."jan", "m_sales"."feb")) AS "unpiv"("a", "b", "c", "d");
+) AS "m_sales"
+UNPIVOT("sales" FOR "month" IN ("m_sales"."jan", "m_sales"."feb")) AS "unpiv"("a", "b", "c", "d");
 
 # title: unpivoted derived table source with a single value column
 # execute: false
 # dialect: snowflake
 SELECT * FROM (SELECT * FROM m_sales) AS m_sales(empid, dept, jan, feb) UNPIVOT(sales FOR month IN (jan, feb)) ORDER BY empid;
 SELECT
-  "_q_0"."EMPID" AS "EMPID",
-  "_q_0"."DEPT" AS "DEPT",
-  "_q_0"."MONTH" AS "MONTH",
-  "_q_0"."SALES" AS "SALES"
+  "_0"."EMPID" AS "EMPID",
+  "_0"."DEPT" AS "DEPT",
+  "_0"."MONTH" AS "MONTH",
+  "_0"."SALES" AS "SALES"
 FROM (
   SELECT
     "M_SALES"."EMPID" AS "EMPID",
@@ -722,31 +741,39 @@ FROM (
     "M_SALES"."JAN" AS "JAN",
     "M_SALES"."FEB" AS "FEB"
   FROM "M_SALES" AS "M_SALES"
-) AS "M_SALES" UNPIVOT("SALES" FOR "MONTH" IN ("JAN", "FEB")) AS "_q_0"
+) AS "M_SALES"
+UNPIVOT("SALES" FOR "MONTH" IN ("JAN", "FEB")) AS "_0"
 ORDER BY
-  "_q_0"."EMPID";
+  "_0"."EMPID";
 
 # title: unpivoted table source with a single value column, unpivot columns can be qualified
 # execute: false
 # dialect: bigquery
-# note: the named columns aren't supported by BQ but we add them here to avoid defining a schema
+# note: the named columns aren not supported by BQ but we add them here to avoid defining a schema
 SELECT * FROM produce AS produce(product, q1, q2, q3, q4) UNPIVOT(sales FOR quarter IN (q1, q2, q3, q4));
 SELECT
-  `_q_0`.`product` AS `product`,
-  `_q_0`.`quarter` AS `quarter`,
-  `_q_0`.`sales` AS `sales`
-FROM `produce` AS `produce` UNPIVOT(`sales` FOR `quarter` IN (`produce`.`q1`, `produce`.`q2`, `produce`.`q3`, `produce`.`q4`)) AS `_q_0`;
+  `produce`.`product` AS `product`,
+  `produce`.`quarter` AS `quarter`,
+  `produce`.`sales` AS `sales`
+FROM `produce` AS `produce`
+UNPIVOT(`sales` FOR `quarter` IN (`produce`.`q1`, `produce`.`q2`, `produce`.`q3`, `produce`.`q4`)) AS `produce`;
 
 # title: unpivoted table source with multiple value columns
 # execute: false
 # dialect: bigquery
 SELECT * FROM produce AS produce(product, q1, q2, q3, q4) UNPIVOT((first_half_sales, second_half_sales) FOR semesters IN ((Q1, Q2) AS 'semester_1', (Q3, Q4) AS 'semester_2'));
 SELECT
-  `_q_0`.`product` AS `product`,
-  `_q_0`.`semesters` AS `semesters`,
-  `_q_0`.`first_half_sales` AS `first_half_sales`,
-  `_q_0`.`second_half_sales` AS `second_half_sales`
-FROM `produce` AS `produce` UNPIVOT((`first_half_sales`, `second_half_sales`) FOR `semesters` IN ((`produce`.`q1`, `produce`.`q2`) AS 'semester_1', (`produce`.`q3`, `produce`.`q4`) AS 'semester_2')) AS `_q_0`;
+  `produce`.`product` AS `product`,
+  `produce`.`semesters` AS `semesters`,
+  `produce`.`first_half_sales` AS `first_half_sales`,
+  `produce`.`second_half_sales` AS `second_half_sales`
+FROM `produce` AS `produce`
+UNPIVOT((`first_half_sales`, `second_half_sales`) FOR 
+  `semesters` IN (
+    (`produce`.`q1`, `produce`.`q2`) AS 'semester_1',
+    (`produce`.`q3`, `produce`.`q4`) AS 'semester_2'
+  )
+) AS `produce`;
 
 # title: quoting is preserved
 # dialect: snowflake
@@ -818,13 +845,13 @@ WHERE
 GROUP BY `dAy`, `top_term`, rank
 ORDER BY `DaY` DESC;
 SELECT
-  `TOp_TeRmS`.`refresh_date` AS `day`,
-  `TOp_TeRmS`.`term` AS `top_term`,
-  `TOp_TeRmS`.`rank` AS `rank`
-FROM `bigquery-public-data.GooGle_tReNDs.TOp_TeRmS` AS `TOp_TeRmS`
+  `top_terms`.`refresh_date` AS `day`,
+  `top_terms`.`term` AS `top_term`,
+  `top_terms`.`rank` AS `rank`
+FROM `bigquery-public-data.GooGle_tReNDs.TOp_TeRmS` AS `top_terms`
 WHERE
-  `TOp_TeRmS`.`rank` = 1
-  AND `TOp_TeRmS`.`refresh_date` >= DATE_SUB(CURRENT_DATE, INTERVAL 2 WEEK)
+  `top_terms`.`rank` = 1
+  AND `top_terms`.`refresh_date` >= DATE_SUB(CURRENT_DATE, INTERVAL '2' WEEK)
 GROUP BY
   `day`,
   `top_term`,
@@ -960,7 +987,7 @@ LEFT JOIN (
 # title: select * from wrapped subquery
 # execute: false
 SELECT * FROM ((SELECT * FROM tbl));
-WITH "_q_0" AS (
+WITH "_0" AS (
   SELECT
     *
   FROM "tbl" AS "tbl"
@@ -968,7 +995,7 @@ WITH "_q_0" AS (
 SELECT
   *
 FROM (
-  "_q_0" AS "_q_0"
+  "_0" AS "_0"
 );
 
 # title: select * from wrapped subquery joined to a table (known schema)
@@ -987,7 +1014,7 @@ FROM (
 # title: select * from wrapped subquery joined to a table (unknown schema)
 # execute: false
 SELECT * FROM ((SELECT c FROM t1) JOIN t2);
-WITH "_q_0" AS (
+WITH "_0" AS (
   SELECT
     "t1"."c" AS "c"
   FROM "t1" AS "t1"
@@ -995,7 +1022,7 @@ WITH "_q_0" AS (
 SELECT
   *
 FROM (
-  "_q_0" AS "_q_0"
+  "_0" AS "_0"
     CROSS JOIN "t2" AS "t2"
 );
 
@@ -1012,11 +1039,11 @@ FROM (
 # title: select * from wrapped join of subqueries (unknown schema)
 # execute: false
 SELECT * FROM ((SELECT * FROM t1) JOIN (SELECT * FROM t2));
-WITH "_q_0" AS (
+WITH "_0" AS (
   SELECT
     *
   FROM "t1" AS "t1"
-), "_q_1" AS (
+), "_1" AS (
   SELECT
     *
   FROM "t2" AS "t2"
@@ -1024,8 +1051,8 @@ WITH "_q_0" AS (
 SELECT
   *
 FROM (
-  "_q_0" AS "_q_0"
-    CROSS JOIN "_q_1" AS "_q_1"
+  "_0" AS "_0"
+    CROSS JOIN "_1" AS "_1"
 );
 
 # title: select * from wrapped join of subqueries (known schema)
@@ -1184,17 +1211,17 @@ SELECT Name,
        (SELECT Name,
                explode(Fruits) as FruitStruct
           FROM fruits_table);
-WITH `_q_0` AS (
+WITH `_0` AS (
   SELECT
     `fruits_table`.`name` AS `name`,
     EXPLODE(`fruits_table`.`fruits`) AS `fruitstruct`
   FROM `fruits_table` AS `fruits_table`
 )
 SELECT
-  `_q_0`.`name` AS `name`,
-  `_q_0`.`fruitstruct`.`$id` AS `$id`,
-  `_q_0`.`fruitstruct`.`value` AS `value`
-FROM `_q_0` AS `_q_0`;
+  `_0`.`name` AS `name`,
+  `_0`.`fruitstruct`.`$id` AS `$id`,
+  `_0`.`fruitstruct`.`value` AS `value`
+FROM `_0` AS `_0`;
 
 # title: mysql is case-sensitive by default
 # dialect: mysql
@@ -1362,22 +1389,28 @@ SELECT
   SUM(`cs1`.`cs_ext_ship_cost`) AS `total shipping cost`,
   SUM(`cs1`.`cs_net_profit`) AS `total net profit`
 FROM `catalog_sales` AS `cs1`
-LEFT JOIN `_u_0` AS `_u_0`
-  ON `_u_0`.`_u_1` = `cs1`.`cs_order_number`
-LEFT JOIN `_u_3` AS `_u_3`
-  ON `_u_3`.`_u_4` = `cs1`.`cs_order_number`
-JOIN `call_center` AS `call_center`
-  ON `call_center`.`cc_call_center_sk` = `cs1`.`cs_call_center_sk`
-  AND `call_center`.`cc_county` IN ('Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County')
-JOIN `customer_address` AS `customer_address`
-  ON `cs1`.`cs_ship_addr_sk` = `customer_address`.`ca_address_sk`
-  AND `customer_address`.`ca_state` = 'GA'
 JOIN `date_dim` AS `date_dim`
   ON `cs1`.`cs_ship_date_sk` = `date_dim`.`d_date_sk`
   AND `date_dim`.`d_date` <= (
     CAST(CAST('2002-02-01' AS DATE) AS TIMESTAMP) + INTERVAL '60' DAYS
   )
   AND `date_dim`.`d_date` >= '2002-02-01'
+JOIN `customer_address` AS `customer_address`
+  ON `cs1`.`cs_ship_addr_sk` = `customer_address`.`ca_address_sk`
+  AND `customer_address`.`ca_state` = 'GA'
+JOIN `call_center` AS `call_center`
+  ON `call_center`.`cc_call_center_sk` = `cs1`.`cs_call_center_sk`
+  AND `call_center`.`cc_county` IN (
+    'Williamson County',
+    'Williamson County',
+    'Williamson County',
+    'Williamson County',
+    'Williamson County'
+  )
+LEFT JOIN `_u_0` AS `_u_0`
+  ON `_u_0`.`_u_1` = `cs1`.`cs_order_number`
+LEFT JOIN `_u_3` AS `_u_3`
+  ON `_u_3`.`_u_4` = `cs1`.`cs_order_number`
 WHERE
   `_u_3`.`_u_4` IS NULL
   AND (
@@ -1430,3 +1463,107 @@ LEFT JOIN "_u_1" AS "_u_1"
   ON "_u_1"."tagname" = "event"."tagname"
 WHERE
   "event"."priority" = 'High' AND NOT "_u_1"."tagname" IS NULL;
+
+# title: SELECT TRANSFORM ... Spark clause when schema is provided
+# execute: false
+# dialect: spark
+WITH a AS (SELECT 'v' AS x) SELECT * FROM (SELECT TRANSFORM(x) USING 'cat' AS (y STRING) FROM a);
+WITH `a` AS (
+  SELECT
+    'v' AS `x`
+), `_0` AS (
+  SELECT
+    TRANSFORM(`a`.`x`) USING 'cat' AS (
+      `y` STRING
+    )
+  FROM `a` AS `a`
+)
+SELECT
+  `_0`.`y` AS `y`
+FROM `_0` AS `_0`;
+
+# title: SELECT TRANSFORM ... Spark clause when schema is not provided
+# execute: false
+# dialect: spark
+WITH a AS (SELECT 'v' AS x) SELECT * FROM (SELECT TRANSFORM(x) USING 'cat'  FROM a);
+WITH `a` AS (
+  SELECT
+    'v' AS `x`
+), `_0` AS (
+  SELECT
+    TRANSFORM(`a`.`x`) USING 'cat'
+  FROM `a` AS `a`
+)
+SELECT
+  `_0`.`key` AS `key`,
+  `_0`.`value` AS `value`
+FROM `_0` AS `_0`;
+
+# title: avoid reordering of non inner joins
+# execute: true
+WITH t1 AS (
+    SELECT NULL AS id1
+),
+t2 AS (
+    SELECT 1 AS id2
+),
+t3 AS (
+    SELECT 'info' AS info
+)
+SELECT 
+  t1.id1 AS id1,
+  t2.id2 AS id2,
+  t3.info AS info
+FROM t1
+RIGHT JOIN t2 AS t2
+  ON t1.id1 = t2.id2
+RIGHT JOIN t3 ON TRUE;
+WITH "t1" AS (
+  SELECT
+    NULL AS "id1"
+), "t2" AS (
+  SELECT
+    1 AS "id2"
+), "t3" AS (
+  SELECT
+    'info' AS "info"
+)
+SELECT
+  "t1"."id1" AS "id1",
+  "t2"."id2" AS "id2",
+  "t3"."info" AS "info"
+FROM "t1" AS "t1"
+RIGHT JOIN "t2" AS "t2"
+  ON "t1"."id1" = "t2"."id2"
+CROSS JOIN "t3" AS "t3";
+
+# title: subquery in GENERATE_SERIES stays untouched
+# execute: false
+WITH t3 AS (SELECT t1.c1::bigint AS ref1 FROM (SELECT MAX(x.a) as c1 FROM x) t1 JOIN GENERATE_SERIES((SELECT MAX(a) FROM x), 10, 1) AS t2(c1) on t2.c1 > t1.c1) SELECT * FROM t3;
+WITH "t1" AS (
+  SELECT
+    MAX("x"."a") AS "c1"
+  FROM "x" AS "x"
+)
+SELECT
+  CAST("t1"."c1" AS BIGINT) AS "ref1"
+FROM "t1" AS "t1"
+JOIN GENERATE_SERIES((
+  SELECT
+    MAX("x"."a") AS "_col_0"
+  FROM "x" AS "x"
+), 10, 1) AS "t2"("c1")
+  ON "t1"."c1" < "t2"."c1";
+
+# title: empty table right join GENERATE_SERIES should have data
+SELECT t1.c1 FROM z AS z RIGHT JOIN GENERATE_SERIES((SELECT MIN(x.a) FROM x), 10, 1) AS t1(c1) ON t1.c1 > z.c;
+SELECT
+  "t1"."c1" AS "c1"
+FROM "z" AS "z"
+RIGHT JOIN GENERATE_SERIES((
+  SELECT
+    MIN("x"."a") AS "_col_0"
+  FROM "x" AS "x"
+), 10, 1) AS "t1"("c1")
+  ON "t1"."c1" > "z"."c"
+;

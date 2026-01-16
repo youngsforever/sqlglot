@@ -1,6 +1,6 @@
+use crate::settings::TokenType;
 use crate::trie::{Trie, TrieResult};
-use crate::{Token, TokenType, TokenTypeSettings, TokenizerDialectSettings, TokenizerSettings};
-use pyo3::exceptions::PyException;
+use crate::{Token, TokenTypeSettings, TokenizerDialectSettings, TokenizerSettings};
 use pyo3::prelude::*;
 use std::cmp::{max, min};
 
@@ -22,14 +22,11 @@ pub struct Tokenizer {
 impl Tokenizer {
     #[new]
     pub fn new(settings: TokenizerSettings, token_types: TokenTypeSettings) -> Tokenizer {
-        let mut keyword_trie = Trie::new();
-        let single_token_strs: Vec<String> = settings
-            .single_tokens
-            .keys()
-            .map(|s| s.to_string())
-            .collect();
-        let trie_filter =
-            |key: &&String| key.contains(" ") || single_token_strs.iter().any(|t| key.contains(t));
+        let mut keyword_trie = Trie::default();
+
+        let trie_filter = |key: &&String| {
+            key.contains(" ") || settings.single_tokens.keys().any(|&t| key.contains(t))
+        };
 
         keyword_trie.add(settings.keywords.keys().filter(trie_filter));
         keyword_trie.add(settings.comments.keys().filter(trie_filter));
@@ -47,7 +44,7 @@ impl Tokenizer {
         &self,
         sql: &str,
         dialect_settings: &TokenizerDialectSettings,
-    ) -> Result<Vec<Token>, PyErr> {
+    ) -> (Vec<Token>, Option<String>) {
         let mut state = TokenizerState::new(
             sql,
             &self.settings,
@@ -55,9 +52,14 @@ impl Tokenizer {
             dialect_settings,
             &self.keyword_trie,
         );
-        state.tokenize().map_err(|e| {
-            PyException::new_err(format!("Error tokenizing '{}': {}", e.context, e.message))
-        })
+        let tokenize_result = state.tokenize();
+        match tokenize_result {
+            Ok(tokens) => (tokens, None),
+            Err(e) => {
+                let msg = format!("Error tokenizing '{}': {}", e.context, e.message);
+                (state.tokens, Some(msg))
+            }
+        }
     }
 }
 
@@ -113,7 +115,7 @@ impl<'a> TokenizerState<'a> {
 
     fn tokenize(&mut self) -> Result<Vec<Token>, TokenizerError> {
         self.scan(None)?;
-        Ok(std::mem::replace(&mut self.tokens, Vec::new()))
+        Ok(std::mem::take(&mut self.tokens))
     }
 
     fn scan(&mut self, until_peek_char: Option<char>) -> Result<(), TokenizerError> {
@@ -144,8 +146,8 @@ impl<'a> TokenizerState<'a> {
                 break;
             }
 
-            if !self.settings.white_space.contains_key(&self.current_char) {
-                if self.current_char.is_digit(10) {
+            if !self.current_char.is_whitespace() {
+                if self.current_char.is_ascii_digit() {
                     self.scan_number()?;
                 } else if let Some(identifier_end) =
                     self.settings.identifiers.get(&self.current_char)
@@ -175,7 +177,7 @@ impl<'a> TokenizerState<'a> {
         if Some(&self.token_types.break_) == self.settings.white_space.get(&self.current_char) {
             // Ensures we don't count an extra line if we get a \r\n line break sequence.
             if !(self.current_char == '\r' && self.peek_char == '\n') {
-                self.column = 1;
+                self.column = i as usize;
                 self.line += 1;
             }
         } else {
@@ -199,12 +201,12 @@ impl<'a> TokenizerState<'a> {
         if end <= self.size {
             self.sql[start..end].iter().collect()
         } else {
-            String::from("")
+            String::new()
         }
     }
 
     fn char_at(&self, index: usize) -> Result<char, TokenizerError> {
-        self.sql.get(index).map(|c| *c).ok_or_else(|| {
+        self.sql.get(index).copied().ok_or_else(|| {
             self.error(format!(
                 "Index {} is out of bound (size {})",
                 index, self.size
@@ -236,7 +238,7 @@ impl<'a> TokenizerState<'a> {
             self.column,
             self.start,
             self.current - 1,
-            std::mem::replace(&mut self.comments, Vec::new()),
+            std::mem::take(&mut self.comments),
         ));
 
         // If we have either a semicolon or a begin token before the command's token, we'll parse
@@ -361,10 +363,27 @@ impl<'a> TokenizerState<'a> {
             // Skip the comment's start delimiter.
             self.advance(comment_start_size as isize)?;
 
+            let mut comment_count = 1;
             let comment_end_size = comment_end.len();
 
-            while !self.is_end && self.chars(comment_end_size) != *comment_end {
+            while !self.is_end {
+                if self.chars(comment_end_size) == *comment_end {
+                    comment_count -= 1;
+                    if comment_count == 0 {
+                        break;
+                    }
+                }
+
                 self.advance(1)?;
+
+                // Nested comments are allowed by some dialects, e.g. databricks, duckdb, postgres
+                if self.settings.nested_comments
+                    && !self.is_end
+                    && self.chars(comment_start_size) == *comment_start
+                {
+                    self.advance(comment_start_size as isize)?;
+                    comment_count += 1
+                }
             }
 
             let text = self.text();
@@ -379,6 +398,16 @@ impl<'a> TokenizerState<'a> {
             }
             self.comments
                 .push(self.text()[comment_start_size..].to_string());
+        }
+
+        if comment_start == self.settings.hint_start
+            && self.tokens.last().is_some()
+            && self
+                .settings
+                .tokens_preceding_hint
+                .contains(&self.tokens.last().unwrap().token_type)
+        {
+            self.add(self.token_types.hint, None)?;
         }
 
         // Leading comment is attached to the succeeding token, whilst trailing comment to the preceding.
@@ -405,31 +434,25 @@ impl<'a> TokenizerState<'a> {
             } else if *token_type == self.token_types.bit_string {
                 (Some(2), *token_type, end.clone())
             } else if *token_type == self.token_types.heredoc_string {
-                if self.settings.heredoc_tag_is_identifier
-                    && !self.is_identifier(self.peek_char)
-                    && self.peek_char.to_string() != *end
-                {
-                    if self.token_types.heredoc_string_alternative != self.token_types.var {
-                        self.add(self.token_types.heredoc_string_alternative, None)?
-                    } else {
-                        self.scan_var()?
-                    };
-
-                    return Ok(true)
-                };
-
                 self.advance(1)?;
 
                 let tag = if self.current_char.to_string() == *end {
-                    String::from("")
+                    String::new()
                 } else {
-                    self.extract_string(end, false, false, !self.settings.heredoc_tag_is_identifier)?
+                    self.extract_string(end, false, true, !self.settings.heredoc_tag_is_identifier)?
                 };
 
-                if self.is_end && !tag.is_empty() && self.settings.heredoc_tag_is_identifier {
-                    self.advance(-(tag.len() as isize))?;
+                if !tag.is_empty()
+                    && self.settings.heredoc_tag_is_identifier
+                    && (self.is_end || tag.chars().all(|c| c.is_ascii_digit()) || tag.chars().any(|c| c.is_whitespace()))
+                {
+                    if !self.is_end {
+                        self.advance(-1)?;
+                    }
+
+                    self.advance(-(tag.chars().count() as isize))?;
                     self.add(self.token_types.heredoc_string_alternative, None)?;
-                    return Ok(true)
+                    return Ok(true);
                 }
 
                 (None, *token_type, format!("{}{}{}", start, tag, end))
@@ -441,10 +464,11 @@ impl<'a> TokenizerState<'a> {
         };
 
         self.advance(start.len() as isize)?;
-        let text = self.extract_string(&end, false, token_type != self.token_types.raw_string, true)?;
+        let text =
+            self.extract_string(&end, false, token_type == self.token_types.raw_string, true)?;
 
         if let Some(b) = base {
-            if u64::from_str_radix(&text, b).is_err() {
+            if !text.is_empty() && u128::from_str_radix(&text, b).is_err() {
                 return self.error_result(format!(
                     "Numeric string contains invalid characters from {}:{}",
                     self.line, self.start
@@ -480,20 +504,30 @@ impl<'a> TokenizerState<'a> {
         let mut scientific = 0;
 
         loop {
-            if self.peek_char.is_digit(10) {
+            if self.peek_char.is_ascii_digit() {
                 self.advance(1)?;
             } else if self.peek_char == '.' && !decimal {
+                if self.tokens.last().map(|t| t.token_type) == Some(self.token_types.parameter) {
+                    return self.add(self.token_types.number, None);
+                }
                 decimal = true;
                 self.advance(1)?;
             } else if (self.peek_char == '-' || self.peek_char == '+') && scientific == 1 {
-                scientific += 1;
-                self.advance(1)?;
+                // Only consume +/- if followed by a digit
+                if self.current + 1 < self.size && self.sql[self.current + 1].is_ascii_digit() {
+                    scientific += 1;
+                    self.advance(1)?;
+                } else {
+                    return self.add(self.token_types.number, None);
+                }
             } else if self.peek_char.to_ascii_uppercase() == 'E' && scientific == 0 {
                 scientific += 1;
                 self.advance(1)?;
-            } else if self.is_identifier(self.peek_char) {
+            } else if self.peek_char == '_' && self.dialect_settings.numbers_can_be_underscore_separated {
+                self.advance(1)?;
+            } else if self.is_alphabetic_or_underscore(self.peek_char) {
                 let number_text = self.text();
-                let mut literal = String::from("");
+                let mut literal = String::new();
 
                 while !self.peek_char.is_whitespace()
                     && !self.is_end
@@ -510,9 +544,9 @@ impl<'a> TokenizerState<'a> {
                         self.settings
                             .numeric_literals
                             .get(&literal.to_uppercase())
-                            .unwrap_or(&String::from("")),
+                            .unwrap_or(&String::new()),
                     )
-                    .map(|x| *x);
+                    .copied();
 
                 if let Some(unwrapped_token_type) = token_type {
                     self.add(self.token_types.number, Some(number_text))?;
@@ -546,9 +580,12 @@ impl<'a> TokenizerState<'a> {
     ) -> Result<(), TokenizerError> {
         self.advance(1)?;
         let value = self.extract_value()?[2..].to_string();
-        match u64::from_str_radix(&value, radix) {
-            Ok(_) => self.add(radix_token_type, Some(value)),
-            Err(_) => self.add(self.token_types.identifier, None),
+
+        // Validate if the string consists only of valid hex digits
+        if value.chars().all(|c| c.is_digit(radix)) {
+            self.add(radix_token_type, Some(value))
+        } else {
+            self.add(self.token_types.identifier, None)
         }
     }
 
@@ -576,7 +613,7 @@ impl<'a> TokenizerState<'a> {
                 self.settings
                     .keywords
                     .get(&self.text().to_uppercase())
-                    .map(|x| *x)
+                    .copied()
                     .unwrap_or(self.token_types.var)
             };
         self.add(token_type, None)
@@ -584,7 +621,7 @@ impl<'a> TokenizerState<'a> {
 
     fn scan_identifier(&mut self, identifier_end: &str) -> Result<(), TokenizerError> {
         self.advance(1)?;
-        let text = self.extract_string(identifier_end, true, true, true)?;
+        let text = self.extract_string(identifier_end, true, false, true)?;
         self.add(self.token_types.identifier, Some(text))
     }
 
@@ -592,20 +629,23 @@ impl<'a> TokenizerState<'a> {
         &mut self,
         delimiter: &str,
         use_identifier_escapes: bool,
-        unescape_sequences: bool,
+        raw_string: bool,
         raise_unmatched: bool,
     ) -> Result<String, TokenizerError> {
-        let mut text = String::from("");
+        let mut text = String::new();
+        let mut combined_identifier_escapes = None;
+        if use_identifier_escapes {
+            let mut tmp = self.settings.identifier_escapes.clone();
+            tmp.extend(delimiter.chars());
+            combined_identifier_escapes = Some(tmp);
+        }
+        let escapes = match combined_identifier_escapes {
+            Some(ref v) => v,
+            None => &self.settings.string_escapes,
+        };
 
         loop {
-            let escapes = if use_identifier_escapes {
-                &self.settings.identifier_escapes
-            } else {
-                &self.settings.string_escapes
-            };
-            let peek_char_str = self.peek_char.to_string();
-
-            if unescape_sequences
+            if !raw_string
                 && !self.dialect_settings.unescaped_sequences.is_empty()
                 && !self.peek_char.is_whitespace()
                 && self.settings.string_escapes.contains(&self.current_char)
@@ -620,60 +660,77 @@ impl<'a> TokenizerState<'a> {
                 }
             }
 
-            if escapes.contains(&self.current_char)
-                && (peek_char_str == delimiter || escapes.contains(&self.peek_char))
+            if (self.settings.string_escapes_allowed_in_raw_strings || !raw_string)
+                && escapes.contains(&self.current_char)
                 && (self.current_char == self.peek_char
                     || !self
                         .settings
                         .quotes
                         .contains_key(&self.current_char.to_string()))
             {
-                if peek_char_str == delimiter {
-                    text.push(self.peek_char);
-                } else {
-                    text.push(self.current_char);
-                    text.push(self.peek_char);
-                }
-                if self.current + 1 < self.size {
-                    self.advance(2)?;
-                } else {
-                    return self.error_result(format!(
-                        "Missing {} from {}:{}",
-                        delimiter, self.line, self.current
-                    ));
-                }
-            } else {
-                if self.chars(delimiter.len()) == delimiter {
-                    if delimiter.len() > 1 {
-                        self.advance((delimiter.len() - 1) as isize)?;
-                    }
-                    break;
-                }
-                if self.is_end {
-                    if !raise_unmatched {
+                let peek_char_str = self.peek_char.to_string();
+                let equal_delimiter = delimiter == peek_char_str;
+                let is_valid_custom_escape =
+                    self.current_char == '\\'
+                        && !self.settings.escape_follow_chars.is_empty()
+                        && !self.settings.escape_follow_chars.contains(&self.peek_char);
+
+                if equal_delimiter 
+                    || escapes.contains(&self.peek_char) 
+                    || is_valid_custom_escape
+                {
+                    if equal_delimiter {
+                        text.push(self.peek_char);
+                    } else if is_valid_custom_escape
+                        && self.current_char != self.peek_char 
+                    {
+                        text.push(self.peek_char);
+                    } else {
                         text.push(self.current_char);
-                        return Ok(text)
+                        text.push(self.peek_char);
                     }
-
-                    return self.error_result(format!(
-                        "Missing {} from {}:{}",
-                        delimiter, self.line, self.current
-                    ));
+                    if self.current + 1 < self.size {
+                        self.advance(2)?;
+                    } else {
+                        return self.error_result(format!(
+                            "Missing {} from {}:{}",
+                            delimiter, self.line, self.current
+                        ));
+                    }
+                    continue;
+                }
+            }
+            let delimiter_char_count = delimiter.chars().count();
+            if self.chars(delimiter_char_count) == delimiter {
+                if delimiter_char_count > 1 {
+                    self.advance((delimiter_char_count - 1) as isize)?;
+                }
+                break;
+            }
+            if self.is_end {
+                if !raise_unmatched {
+                    text.push(self.current_char);
+                    return Ok(text);
                 }
 
-                let current = self.current - 1;
-                self.advance(1)?;
-                text.push_str(
-                    &self.sql[current..self.current - 1]
-                        .iter()
-                        .collect::<String>(),
-                );
+                return self.error_result(format!(
+                    "Missing {} from {}:{}",
+                    delimiter, self.line, self.current
+                ));
             }
+
+            let current = self.current - 1;
+            self.advance(1)?;
+            text.push_str(
+                &self.sql[current..self.current - 1]
+                    .iter()
+                    .collect::<String>(),
+            );
         }
         Ok(text)
     }
 
-    fn is_identifier(&mut self, name: char) -> bool {
+    fn is_alphabetic_or_underscore(&self, name: char) -> bool {
         name.is_alphabetic() || name == '_'
     }
 

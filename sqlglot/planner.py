@@ -94,7 +94,7 @@ class Step:
         """
         ctes = ctes or {}
         expression = expression.unnest()
-        with_ = expression.args.get("with")
+        with_ = expression.args.get("with_")
 
         # CTEs break the mold of scope and introduce themselves to all in the context.
         if with_:
@@ -104,11 +104,11 @@ class Step:
                 step.name = cte.alias
                 ctes[step.name] = step  # type: ignore
 
-        from_ = expression.args.get("from")
+        from_ = expression.args.get("from_")
 
         if isinstance(expression, exp.Select) and from_:
             step = Scan.from_expression(from_.this, ctes)
-        elif isinstance(expression, exp.Union):
+        elif isinstance(expression, exp.SetOperation):
             step = SetOperation.from_expression(expression, ctes)
         else:
             step = Scan()
@@ -124,13 +124,13 @@ class Step:
 
         projections = []  # final selects in this chain of steps representing a select
         operands = {}  # intermediate computations of agg funcs eg x + 1 in SUM(x + 1)
-        aggregations = set()
+        aggregations = {}
         next_operand_name = name_sequence("_a_")
 
         def extract_agg_operands(expression):
             agg_funcs = tuple(expression.find_all(exp.AggFunc))
             if agg_funcs:
-                aggregations.add(expression)
+                aggregations[expression] = None
 
             for agg in agg_funcs:
                 for operand in agg.unnest_operands():
@@ -201,11 +201,13 @@ class Step:
 
             aggregate.add_dependency(step)
             step = aggregate
+        else:
+            aggregate = None
 
         order = expression.args.get("order")
 
         if order:
-            if isinstance(step, Aggregate):
+            if aggregate and isinstance(step, Aggregate):
                 for i, ordered in enumerate(order.expressions):
                     if extract_agg_operands(exp.alias_(ordered.this, f"_o_{i}", quoted=True)):
                         ordered.this.replace(exp.column(f"_o_{i}", step.name, quoted=True))
@@ -426,7 +428,7 @@ class SetOperation(Step):
     def from_expression(
         cls, expression: exp.Expression, ctes: t.Optional[t.Dict[str, Step]] = None
     ) -> SetOperation:
-        assert isinstance(expression, exp.Union)
+        assert isinstance(expression, exp.SetOperation)
 
         left = Step.from_expression(expression.left, ctes)
         # SELECT 1 UNION SELECT 2  <-- these subqueries don't have names

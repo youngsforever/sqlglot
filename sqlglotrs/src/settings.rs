@@ -1,10 +1,12 @@
 use pyo3::prelude::*;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 
 pub type TokenType = u16;
 
 #[derive(Clone, Debug)]
 #[pyclass]
+#[cfg_attr(feature = "profiling", derive(serde::Serialize, serde::Deserialize))]
 pub struct TokenTypeSettings {
     pub bit_string: TokenType,
     pub break_: TokenType,
@@ -19,6 +21,7 @@ pub struct TokenTypeSettings {
     pub string: TokenType,
     pub var: TokenType,
     pub heredoc_string_alternative: TokenType,
+    pub hint: TokenType,
 }
 
 #[pymethods]
@@ -38,8 +41,9 @@ impl TokenTypeSettings {
         string: TokenType,
         var: TokenType,
         heredoc_string_alternative: TokenType,
+        hint: TokenType,
     ) -> Self {
-        TokenTypeSettings {
+        let token_type_settings = TokenTypeSettings {
             bit_string,
             break_,
             dcolon,
@@ -53,12 +57,32 @@ impl TokenTypeSettings {
             string,
             var,
             heredoc_string_alternative,
+            hint,
+        };
+
+        #[cfg(feature = "profiling")]
+        {
+            token_type_settings.write_json_to_string();
         }
+
+        token_type_settings
+    }
+}
+
+#[cfg(feature = "profiling")]
+impl TokenTypeSettings {
+    pub fn write_json_to_string(&self) {
+        let json = serde_json::to_string(self).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benches/token_type_settings.json");
+        // Write to file
+        std::fs::write(path, &json).unwrap();
     }
 }
 
 #[derive(Clone, Debug)]
 #[pyclass]
+#[cfg_attr(feature = "profiling", derive(serde::Serialize, serde::Deserialize))]
 pub struct TokenizerSettings {
     pub white_space: HashMap<char, TokenType>,
     pub single_tokens: HashMap<char, TokenType>,
@@ -75,7 +99,12 @@ pub struct TokenizerSettings {
     pub var_single_tokens: HashSet<char>,
     pub commands: HashSet<TokenType>,
     pub command_prefix_tokens: HashSet<TokenType>,
+    pub tokens_preceding_hint: HashSet<TokenType>,
     pub heredoc_tag_is_identifier: bool,
+    pub string_escapes_allowed_in_raw_strings: bool,
+    pub nested_comments: bool,
+    pub hint_start: String,
+    pub escape_follow_chars: HashSet<char>,
 }
 
 #[pymethods]
@@ -97,7 +126,12 @@ impl TokenizerSettings {
         var_single_tokens: HashSet<String>,
         commands: HashSet<TokenType>,
         command_prefix_tokens: HashSet<TokenType>,
+        tokens_preceding_hint: HashSet<TokenType>,
         heredoc_tag_is_identifier: bool,
+        string_escapes_allowed_in_raw_strings: bool,
+        nested_comments: bool,
+        hint_start: String,
+        escape_follow_chars: HashSet<String>,
     ) -> Self {
         let to_char = |v: &String| {
             if v.len() == 1 {
@@ -126,11 +160,12 @@ impl TokenizerSettings {
             identifier_escapes.iter().map(&to_char).collect();
 
         let string_escapes_native: HashSet<char> = string_escapes.iter().map(&to_char).collect();
+        let escape_follow_chars_native: HashSet<char> = escape_follow_chars.iter().map(&to_char).collect();
 
         let var_single_tokens_native: HashSet<char> =
             var_single_tokens.iter().map(&to_char).collect();
 
-        TokenizerSettings {
+        let tokenizer_settings = TokenizerSettings {
             white_space: white_space_native,
             single_tokens: single_tokens_native,
             keywords,
@@ -146,16 +181,41 @@ impl TokenizerSettings {
             var_single_tokens: var_single_tokens_native,
             commands,
             command_prefix_tokens,
+            tokens_preceding_hint,
             heredoc_tag_is_identifier,
+            string_escapes_allowed_in_raw_strings,
+            nested_comments,
+            hint_start,
+            escape_follow_chars: escape_follow_chars_native,
+        };
+
+        #[cfg(feature = "profiling")]
+        {
+            tokenizer_settings.write_json_to_string();
         }
+
+        tokenizer_settings
+    }
+}
+
+#[cfg(feature = "profiling")]
+impl TokenizerSettings {
+    pub fn write_json_to_string(&self) {
+        let json = serde_json::to_string(self).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benches/tokenizer_settings.json");
+        // Write to file
+        std::fs::write(path, &json).unwrap();
     }
 }
 
 #[derive(Clone, Debug)]
 #[pyclass]
+#[cfg_attr(feature = "profiling", derive(serde::Serialize, serde::Deserialize))]
 pub struct TokenizerDialectSettings {
     pub unescaped_sequences: HashMap<String, String>,
     pub identifiers_can_start_with_digit: bool,
+    pub numbers_can_be_underscore_separated: bool,
 }
 
 #[pymethods]
@@ -164,10 +224,29 @@ impl TokenizerDialectSettings {
     pub fn new(
         unescaped_sequences: HashMap<String, String>,
         identifiers_can_start_with_digit: bool,
+        numbers_can_be_underscore_separated: bool,
     ) -> Self {
-        TokenizerDialectSettings {
+        let settings = TokenizerDialectSettings {
             unescaped_sequences,
             identifiers_can_start_with_digit,
+            numbers_can_be_underscore_separated,
+        };
+
+        #[cfg(feature = "profiling")]
+        {
+            settings.write_json_to_string();
         }
+
+        settings
+    }
+}
+
+#[cfg(feature = "profiling")]
+impl TokenizerDialectSettings {
+    pub fn write_json_to_string(&self) {
+        let json = serde_json::to_string(self).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benches/tokenizer_dialect_settings.json");
+        std::fs::write(path, &json).unwrap();
     }
 }

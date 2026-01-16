@@ -7,7 +7,6 @@ from sqlglot.dialects.dialect import Dialect, DialectType
 from sqlglot.optimizer.isolate_table_selects import isolate_table_selects
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify_columns import (
-    pushdown_cte_alias_columns as pushdown_cte_alias_columns_func,
     qualify_columns as qualify_columns_func,
     quote_identifiers as quote_identifiers_func,
     validate_qualify_columns as validate_qualify_columns_func,
@@ -27,9 +26,13 @@ def qualify(
     infer_schema: t.Optional[bool] = None,
     isolate_tables: bool = False,
     qualify_columns: bool = True,
+    allow_partial_qualification: bool = False,
     validate_qualify_columns: bool = True,
     quote_identifiers: bool = True,
     identify: bool = True,
+    canonicalize_table_aliases: bool = False,
+    on_qualify: t.Optional[t.Callable[[exp.Expression], None]] = None,
+    sql: t.Optional[str] = None,
 ) -> exp.Expression:
     """
     Rewrite sqlglot AST to have normalized and qualified tables and columns.
@@ -55,24 +58,40 @@ def qualify(
         infer_schema: Whether to infer the schema if missing.
         isolate_tables: Whether to isolate table selects.
         qualify_columns: Whether to qualify columns.
+        allow_partial_qualification: Whether to allow partial qualification.
         validate_qualify_columns: Whether to validate columns.
         quote_identifiers: Whether to run the quote_identifiers step.
             This step is necessary to ensure correctness for case sensitive queries.
             But this flag is provided in case this step is performed at a later time.
         identify: If True, quote all identifiers, else only necessary ones.
+        canonicalize_table_aliases: Whether to use canonical aliases (_0, _1, ...) for all sources
+            instead of preserving table names.
+        on_qualify: Callback after a table has been qualified.
+        sql: Original SQL string for error highlighting. If not provided, errors will not include
+            highlighting. Requires that the expression has position metadata from parsing.
 
     Returns:
         The qualified expression.
     """
     schema = ensure_schema(schema, dialect=dialect)
-    expression = normalize_identifiers(expression, dialect=dialect)
-    expression = qualify_tables(expression, db=db, catalog=catalog, schema=schema, dialect=dialect)
+    dialect = Dialect.get_or_raise(dialect)
+
+    expression = normalize_identifiers(
+        expression,
+        dialect=dialect,
+        store_original_column_identifiers=True,
+    )
+    expression = qualify_tables(
+        expression,
+        db=db,
+        catalog=catalog,
+        dialect=dialect,
+        on_qualify=on_qualify,
+        canonicalize_table_aliases=canonicalize_table_aliases,
+    )
 
     if isolate_tables:
         expression = isolate_table_selects(expression, schema=schema)
-
-    if Dialect.get_or_raise(dialect).PREFER_CTE_ALIAS_COLUMN:
-        expression = pushdown_cte_alias_columns_func(expression)
 
     if qualify_columns:
         expression = qualify_columns_func(
@@ -81,12 +100,13 @@ def qualify(
             expand_alias_refs=expand_alias_refs,
             expand_stars=expand_stars,
             infer_schema=infer_schema,
+            allow_partial_qualification=allow_partial_qualification,
         )
 
     if quote_identifiers:
         expression = quote_identifiers_func(expression, dialect=dialect, identify=identify)
 
     if validate_qualify_columns:
-        validate_qualify_columns_func(expression)
+        validate_qualify_columns_func(expression, sql=sql)
 
     return expression

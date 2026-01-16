@@ -259,7 +259,7 @@ FROM
   t1;
 WITH t1 AS (SELECT x.a AS a, x.b AS b, ROW_NUMBER() OVER (PARTITION BY x.a ORDER BY x.a) AS row_num FROM x AS x) SELECT SUM(t1.row_num) AS total_rows FROM t1 AS t1;
 
-# title: Test prevent merging of window if in group by func
+# title: Test prevent merging of window if in group by
 with t1 as (
   SELECT
     x.a,
@@ -277,7 +277,7 @@ GROUP BY t1.row_num
 ORDER BY t1.row_num;
 WITH t1 AS (SELECT x.a AS a, x.b AS b, ROW_NUMBER() OVER (PARTITION BY x.a ORDER BY x.a) AS row_num FROM x AS x) SELECT t1.row_num AS row_num, SUM(t1.a) AS total FROM t1 AS t1 GROUP BY t1.row_num ORDER BY row_num;
 
-# title: Test prevent merging of window if in order by func
+# title: Test prevent merging of window if in order by
 with t1 as (
   SELECT
     x.a,
@@ -293,6 +293,23 @@ FROM
   t1
 ORDER BY t1.row_num, t1.a;
 WITH t1 AS (SELECT x.a AS a, x.b AS b, ROW_NUMBER() OVER (PARTITION BY x.a ORDER BY x.a) AS row_num FROM x AS x) SELECT t1.row_num AS row_num, t1.a AS a FROM t1 AS t1 ORDER BY t1.row_num, t1.a;
+
+# title: Test preventing merging of window nested under complex projection if in order by
+WITH t1 AS (
+  SELECT
+    x.a,
+    x.b,
+    ROW_NUMBER() OVER (PARTITION BY x.a ORDER BY x.a) - 1 AS row_num
+  FROM
+    x
+)
+SELECT
+  t1.row_num AS row_num,
+  t1.a AS a
+FROM
+  t1
+ORDER BY t1.row_num, t1.a;
+WITH t1 AS (SELECT x.a AS a, x.b AS b, ROW_NUMBER() OVER (PARTITION BY x.a ORDER BY x.a) - 1 AS row_num FROM x AS x) SELECT t1.row_num AS row_num, t1.a AS a FROM t1 AS t1 ORDER BY t1.row_num, t1.a;
 
 # title: Test allow merging of window function
 with t1 as (
@@ -312,7 +329,12 @@ FROM
   t1;
 SELECT x.a AS a, x.b AS b, ROW_NUMBER() OVER (PARTITION BY x.a ORDER BY x.a) AS row_num FROM x AS x ORDER BY x.a, x.b, row_num;
 
-# title: Don't merge window functions, inner table is aliased in outer query
+# title: Keep ORDER BY
+# execute: false
+WITH t AS (SELECT t1.x AS x, t1.y AS y, t2.a AS a, t2.b AS b FROM t1 AS t1(x, y) CROSS JOIN t2 AS t2(a, b) ORDER BY t2.a) SELECT t.x AS x, t.y AS y, t.a AS a, t.b AS b FROM t AS t;
+SELECT t1.x AS x, t1.y AS y, t2.a AS a, t2.b AS b FROM t1 AS t1(x, y) CROSS JOIN t2 AS t2(a, b) ORDER BY t2.a;
+
+# title: Do not merge window functions, inner table is aliased in outer query
 with t1 as (
   SELECT
     ROW_NUMBER() OVER (PARTITION BY x.a ORDER BY x.a) as row_num
@@ -446,3 +468,74 @@ SELECT
   1 AS a;
 WITH q AS (SELECT x.a AS a FROM x AS x ORDER BY x.a) SELECT q.a AS a FROM q AS q UNION ALL SELECT 1 AS a;
 
+# title: Consecutive inner - outer conflicting names
+WITH tbl AS (select 1 as id)
+SELECT
+  id
+FROM (
+  SELECT OTBL.id
+  FROM (
+    SELECT OTBL.id
+    FROM (
+      SELECT OTBL.id
+      FROM tbl AS OTBL
+      LEFT OUTER JOIN tbl AS ITBL ON OTBL.id = ITBL.id
+    ) AS OTBL
+    LEFT OUTER JOIN tbl AS ITBL ON OTBL.id = ITBL.id
+  ) AS OTBL
+  LEFT OUTER JOIN tbl AS ITBL ON OTBL.id = ITBL.id
+) AS ITBL;
+WITH tbl AS (SELECT 1 AS id) SELECT OTBL.id AS id FROM tbl AS OTBL LEFT OUTER JOIN tbl AS ITBL_2 ON OTBL.id = ITBL_2.id LEFT OUTER JOIN tbl AS ITBL_3 ON OTBL.id = ITBL_3.id LEFT OUTER JOIN tbl AS ITBL ON OTBL.id = ITBL.id;
+
+# title: Inner query contains subquery with an alias that conflicts with outer query
+WITH i AS (
+  SELECT
+    a
+  FROM (
+    SELECT 1 a
+  ) AS conflict
+), j AS (
+  SELECT 1 AS a
+)
+SELECT
+  i.a,
+  conflict.a
+FROM i
+LEFT JOIN j AS conflict
+  ON i.a = conflict.a;
+WITH j AS (SELECT 1 AS a) SELECT conflict_2.a AS a, conflict.a AS a FROM (SELECT 1 AS a) AS conflict_2 LEFT JOIN j AS conflict ON conflict_2.a = conflict.a;
+
+# title: column name is not lost
+with cte as (
+    select x.a * x.b as mult from x
+)
+select cte.mult from cte;
+SELECT x.a * x.b AS mult FROM x AS x;
+
+# title: avoid merging subquery with JOIN
+WITH t0 AS (
+  SELECT
+    5 AS id
+), t1 AS (
+  SELECT
+    1 AS id,
+    'US' AS cid
+), t2 AS (
+  SELECT
+    1 AS id,
+    'US' AS cid
+)
+SELECT
+  t0.id,
+  t3.cid AS cid
+FROM t0
+INNER JOIN (
+  SELECT
+    t1.id,
+    t2.cid
+  FROM t1
+  RIGHT JOIN t2
+    ON t1.cid = t2.cid
+) AS t3
+  ON t0.id = t3.id;
+WITH t0 AS (SELECT 5 AS id), t1 AS (SELECT 1 AS id, 'US' AS cid), t2 AS (SELECT 1 AS id, 'US' AS cid) SELECT t0.id AS id, t3.cid AS cid FROM t0 AS t0 INNER JOIN (SELECT t1.id AS id, t2.cid AS cid FROM t1 AS t1 RIGHT JOIN t2 AS t2 ON t1.cid = t2.cid) AS t3 ON t0.id = t3.id;

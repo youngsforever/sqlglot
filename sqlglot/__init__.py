@@ -27,11 +27,15 @@ from sqlglot.expressions import (
     cast as cast,
     column as column,
     condition as condition,
+    delete as delete,
     except_ as except_,
+    find_tables as find_tables,
     from_ as from_,
     func as func,
+    insert as insert,
     intersect as intersect,
     maybe_parse as maybe_parse,
+    merge as merge,
     not_ as not_,
     or_ as or_,
     select as select,
@@ -64,9 +68,6 @@ except ImportError:
 
 pretty = False
 """Whether to format generated SQL by default."""
-
-schema = MappingSchema()
-"""The default schema used by SQLGlot (e.g. in the optimizer)."""
 
 
 def tokenize(sql: str, read: DialectType = None, dialect: DialectType = None) -> t.List[Token]:

@@ -1,4 +1,7 @@
-from sqlglot import expressions as exp
+import unittest
+import sys
+
+from sqlglot import UnsupportedError, expressions as exp
 from sqlglot.dialects.mysql import MySQL
 from tests.dialects.test_dialect import Validator
 
@@ -11,16 +14,44 @@ class TestMySQL(Validator):
             self.validate_identity(f"CREATE TABLE t (id {t} UNSIGNED)")
             self.validate_identity(f"CREATE TABLE t (id {t}(10) UNSIGNED)")
 
+        self.validate_identity("CREATE TABLE bar (abacate DOUBLE(10, 2) UNSIGNED)")
         self.validate_identity("CREATE TABLE t (id DECIMAL(20, 4) UNSIGNED)")
         self.validate_identity("CREATE TABLE foo (a BIGINT, UNIQUE (b) USING BTREE)")
         self.validate_identity("CREATE TABLE foo (id BIGINT)")
         self.validate_identity("CREATE TABLE 00f (1d BIGINT)")
+        self.validate_identity("CREATE TABLE temp (id SERIAL PRIMARY KEY)")
         self.validate_identity("UPDATE items SET items.price = 0 WHERE items.id >= 5 LIMIT 10")
         self.validate_identity("DELETE FROM t WHERE a <= 10 LIMIT 10")
+        self.validate_identity("DELETE FROM t FORCE INDEX (idx) WHERE a > 5 ORDER BY id")
         self.validate_identity("CREATE TABLE foo (a BIGINT, INDEX USING BTREE (b))")
         self.validate_identity("CREATE TABLE foo (a BIGINT, FULLTEXT INDEX (b))")
         self.validate_identity("CREATE TABLE foo (a BIGINT, SPATIAL INDEX (b))")
+        self.validate_identity("CREATE TABLE foo (a INT UNSIGNED ZEROFILL)")
         self.validate_identity("ALTER TABLE t1 ADD COLUMN x INT, ALGORITHM=INPLACE, LOCK=EXCLUSIVE")
+        self.validate_identity("ALTER TABLE t ADD INDEX `i` (`c`)")
+        self.validate_identity("ALTER TABLE t ADD UNIQUE `i` (`c`)")
+        self.validate_identity("ALTER TABLE test_table MODIFY COLUMN test_column LONGTEXT")
+        self.validate_identity("ALTER VIEW v AS SELECT a, b, c, d FROM foo")
+        self.validate_identity("ALTER VIEW v AS SELECT * FROM foo WHERE c > 100")
+        self.validate_identity(
+            "ALTER ALGORITHM = MERGE VIEW v AS SELECT * FROM foo", check_command_warning=True
+        )
+        self.validate_identity(
+            "ALTER DEFINER = 'admin'@'localhost' VIEW v AS SELECT * FROM foo",
+            check_command_warning=True,
+        )
+        self.validate_identity(
+            "CREATE SQL SECURITY INVOKER VIEW id_test (id, foo) AS SELECT 0, foo FROM test"
+        )
+        self.validate_identity(
+            "CREATE SQL SECURITY DEFINER VIEW id_test (id, foo) AS SELECT 0, foo FROM test"
+        )
+        self.validate_identity(
+            "ALTER SQL SECURITY = DEFINER VIEW v AS SELECT * FROM foo", check_command_warning=True
+        )
+        self.validate_identity(
+            "INSERT INTO things (a, b) VALUES (1, 2) AS new_data ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id), a = new_data.a, b = new_data.b"
+        )
         self.validate_identity(
             "CREATE TABLE `oauth_consumer` (`key` VARCHAR(32) NOT NULL, UNIQUE `OAUTH_CONSUMER_KEY` (`key`))"
         )
@@ -61,6 +92,45 @@ class TestMySQL(Validator):
             "CREATE OR REPLACE VIEW my_view AS SELECT column1 AS `boo`, column2 AS `foo` FROM my_table WHERE column3 = 'some_value' UNION SELECT q.* FROM fruits_table, JSON_TABLE(Fruits, '$[*]' COLUMNS(id VARCHAR(255) PATH '$.$id', value VARCHAR(255) PATH '$.value')) AS q",
         )
         self.validate_identity(
+            "CREATE TABLE test_table (id INT AUTO_INCREMENT, PRIMARY KEY (id) USING BTREE)"
+        )
+        self.validate_identity(
+            "CREATE TABLE test_table (id INT AUTO_INCREMENT, PRIMARY KEY (id) USING HASH)"
+        )
+        self.validate_identity("CREATE TABLE test (id INT, PRIMARY KEY pk_name (id))")
+        self.validate_identity("CREATE TABLE test (id INT, PRIMARY KEY `pk_name` (id))")
+        self.validate_identity(
+            'CREATE TABLE test (id INT, PRIMARY KEY "pk_name" (id))',
+            "CREATE TABLE test (id INT, PRIMARY KEY `pk_name` (id))",
+        )
+        self.validate_identity("CREATE TABLE test (id INT, CONSTRAINT pk_name PRIMARY KEY (id))")
+        self.validate_identity(
+            "CREATE TABLE test (a INT, b INT GENERATED ALWAYS AS (a + a) STORED)"
+        )
+        self.validate_identity(
+            "CREATE TABLE test (a INT, b INT GENERATED ALWAYS AS (a + a) VIRTUAL)"
+        )
+        self.validate_identity(
+            "CREATE TABLE test (a INT, b INT AS (a + a) STORED)",
+            "CREATE TABLE test (a INT, b INT GENERATED ALWAYS AS (a + a) STORED)",
+        )
+        self.validate_identity(
+            "CREATE TABLE test (a INT, b INT AS (a + a) VIRTUAL)",
+            "CREATE TABLE test (a INT, b INT GENERATED ALWAYS AS (a + a) VIRTUAL)",
+        )
+        self.validate_identity(
+            "/*left*/ EXPLAIN SELECT /*hint*/ col FROM t1 /*right*/",
+            "/* left */ DESCRIBE /* hint */ SELECT col FROM t1 /* right */",
+        )
+        self.validate_identity(
+            "CREATE TABLE t (name VARCHAR)",
+            "CREATE TABLE t (name TEXT)",
+        )
+        self.validate_identity(
+            "ALTER TABLE t ADD KEY `i` (`c`)",
+            "ALTER TABLE t ADD INDEX `i` (`c`)",
+        )
+        self.validate_identity(
             "CREATE TABLE `foo` (`id` char(36) NOT NULL DEFAULT (uuid()), PRIMARY KEY (`id`), UNIQUE KEY `id` (`id`))",
             "CREATE TABLE `foo` (`id` CHAR(36) NOT NULL DEFAULT (UUID()), PRIMARY KEY (`id`), UNIQUE `id` (`id`))",
         )
@@ -70,13 +140,10 @@ class TestMySQL(Validator):
         )
         self.validate_identity(
             "CREATE TABLE test (ts TIMESTAMP, ts_tz TIMESTAMPTZ, ts_ltz TIMESTAMPLTZ)",
-            "CREATE TABLE test (ts DATETIME, ts_tz TIMESTAMP, ts_ltz TIMESTAMP)",
+            "CREATE TABLE test (ts TIMESTAMP, ts_tz TIMESTAMP, ts_ltz TIMESTAMP)",
         )
         self.validate_identity(
             "ALTER TABLE test_table ALTER COLUMN test_column SET DATA TYPE LONGTEXT",
-            "ALTER TABLE test_table MODIFY COLUMN test_column LONGTEXT",
-        )
-        self.validate_identity(
             "ALTER TABLE test_table MODIFY COLUMN test_column LONGTEXT",
         )
         self.validate_identity(
@@ -87,7 +154,18 @@ class TestMySQL(Validator):
             "CREATE TABLE `foo` (a VARCHAR(10), KEY idx_a (a DESC))",
             "CREATE TABLE `foo` (a VARCHAR(10), INDEX idx_a (a DESC))",
         )
+        self.validate_identity(
+            "CREATE TABLE `foo` (a VARCHAR(10), UNIQUE INDEX idx_a (a))",
+            "CREATE TABLE `foo` (a VARCHAR(10), UNIQUE idx_a (a))",
+        )
 
+        self.validate_all(
+            "insert into t(i) values (default)",
+            write={
+                "duckdb": "INSERT INTO t (i) VALUES (DEFAULT)",
+                "mysql": "INSERT INTO t (i) VALUES (DEFAULT)",
+            },
+        )
         self.validate_all(
             "CREATE TABLE t (id INT UNSIGNED)",
             write={
@@ -111,8 +189,18 @@ class TestMySQL(Validator):
                 "sqlite": "CREATE TABLE x (id INTEGER NOT NULL AUTOINCREMENT PRIMARY KEY)",
             },
         )
+        self.validate_identity("ALTER TABLE t ALTER INDEX i INVISIBLE")
+        self.validate_identity("ALTER TABLE t ALTER INDEX i VISIBLE")
+        self.validate_identity("ALTER TABLE t ALTER COLUMN c SET INVISIBLE")
+        self.validate_identity("ALTER TABLE t ALTER COLUMN c SET VISIBLE")
+        self.validate_identity(
+            "UPDATE foo JOIN bar ON TRUE SET foo.a = bar.a WHERE foo.id = bar.id"
+        )
 
     def test_identity(self):
+        self.validate_identity("SELECT HIGH_PRIORITY STRAIGHT_JOIN SQL_CALC_FOUND_ROWS * FROM t")
+        self.validate_identity("SELECT CAST(COALESCE(`id`, 'NULL') AS CHAR CHARACTER SET binary)")
+        self.validate_identity("SELECT e.* FROM e STRAIGHT_JOIN p ON e.x = p.y")
         self.validate_identity("ALTER TABLE test_table ALTER COLUMN test_column SET DEFAULT 1")
         self.validate_identity("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:00.0000')")
         self.validate_identity("SELECT @var1 := 1, @var2")
@@ -129,6 +217,7 @@ class TestMySQL(Validator):
         self.validate_identity("""SELECT 'ab' MEMBER OF('[23, "abc", 17, "ab", 10]')""")
         self.validate_identity("""SELECT * FROM foo WHERE 'ab' MEMBER OF(content)""")
         self.validate_identity("SELECT CURRENT_TIMESTAMP(6)")
+        self.validate_identity("SELECT CURRENT_ROLE()")
         self.validate_identity("x ->> '$.name'")
         self.validate_identity("SELECT CAST(`a`.`b` AS CHAR) FROM foo")
         self.validate_identity("SELECT TRIM(LEADING 'bla' FROM ' XXX ')")
@@ -140,6 +229,9 @@ class TestMySQL(Validator):
         self.validate_identity("SELECT * FROM t1, t2 FOR SHARE OF t1, t2 SKIP LOCKED")
         self.validate_identity("SELECT a || b", "SELECT a OR b")
         self.validate_identity(
+            "SELECT * FROM source, JSON_TABLE(source.links, '$.org[*]' COLUMNS(row_id FOR ORDINALITY, link VARCHAR(255) PATH '$.link')) AS links"
+        )
+        self.validate_identity(
             "SELECT * FROM x ORDER BY BINARY a", "SELECT * FROM x ORDER BY CAST(a AS BINARY)"
         )
         self.validate_identity(
@@ -149,8 +241,19 @@ class TestMySQL(Validator):
             "SELECT * FROM t1, t2, t3 FOR SHARE OF t1 NOWAIT FOR UPDATE OF t2, t3 SKIP LOCKED"
         )
         self.validate_identity(
+            "REPLACE INTO table SELECT id FROM table2 WHERE cnt > 100", check_command_warning=True
+        )
+        self.validate_identity(
+            "CAST(x AS VARCHAR)",
+            "CAST(x AS CHAR)",
+        )
+        self.validate_identity(
             """SELECT * FROM foo WHERE 3 MEMBER OF(info->'$.value')""",
             """SELECT * FROM foo WHERE 3 MEMBER OF(JSON_EXTRACT(info, '$.value'))""",
+        )
+        self.validate_identity(
+            "SELECT 1 AS row",
+            "SELECT 1 AS `row`",
         )
 
         # Index hints
@@ -201,8 +304,7 @@ class TestMySQL(Validator):
         self.validate_identity("SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         self.validate_identity("SET TRANSACTION READ ONLY")
         self.validate_identity("SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE")
-        self.validate_identity("SELECT SCHEMA()")
-        self.validate_identity("SELECT DATABASE()")
+        self.validate_identity("DATABASE()", "SCHEMA()")
         self.validate_identity(
             "SET GLOBAL sort_buffer_size = 1000000, SESSION sort_buffer_size = 1000000"
         )
@@ -210,11 +312,30 @@ class TestMySQL(Validator):
             "SET @@GLOBAL.sort_buffer_size = 1000000, @@LOCAL.sort_buffer_size = 1000000"
         )
         self.validate_identity("INTERVAL '1' YEAR")
-        self.validate_identity("DATE_ADD(x, INTERVAL 1 YEAR)")
+        self.validate_identity("DATE_ADD(x, INTERVAL '1' YEAR)")
         self.validate_identity("CHAR(0)")
         self.validate_identity("CHAR(77, 121, 83, 81, '76')")
         self.validate_identity("CHAR(77, 77.3, '77.3' USING utf8mb4)")
         self.validate_identity("SELECT * FROM t1 PARTITION(p0)")
+        self.validate_identity("SELECT @var1 := 1, @var2")
+        self.validate_identity("SELECT @var1, @var2 := @var1")
+        self.validate_identity("SELECT @var1 := COUNT(*) FROM t1")
+        self.validate_identity("SET @var1 := 1", "SET @var1 = 1")
+
+        self.validate_identity(
+            "SELECT DISTINCTROW tbl.col FROM tbl", "SELECT DISTINCT tbl.col FROM tbl"
+        )
+        self.validate_identity("ATAN(y, x)")
+
+        self.validate_identity(
+            "SELECT 'foo' SOUNDS LIKE 'bar'", "SELECT SOUNDEX('foo') = SOUNDEX('bar')"
+        )
+        self.validate_identity(
+            "SELECT 'foo' NOT SOUNDS LIKE 'bar'", "SELECT NOT SOUNDEX('foo') = SOUNDEX('bar')"
+        )
+        self.validate_identity("SELECT SUBSTR(1 FROM 2 FOR 3)", "SELECT SUBSTRING(1, 2, 3)")
+        self.validate_identity("SELECT ELT(2, 'foo', 'bar', 'baz') AS Result")
+        self.validate_identity("SELECT CHARSET(CHAR(100 USING utf8))")
 
     def test_types(self):
         for char_type in MySQL.Generator.CHAR_CAST_MAPPING:
@@ -233,7 +354,7 @@ class TestMySQL(Validator):
         )
         self.validate_identity(
             "CAST(x AS TIMESTAMP)",
-            "CAST(x AS DATETIME)",
+            "TIMESTAMP(x)",
         )
         self.validate_identity(
             "CAST(x AS TIMESTAMPTZ)",
@@ -277,6 +398,24 @@ class TestMySQL(Validator):
             write={
                 "mysql": "CHAR(10)",
                 "presto": "CHR(10)",
+                "sqlite": "CHAR(10)",
+                "tsql": "CHAR(10)",
+            },
+        )
+        self.validate_identity("CREATE TABLE t (foo VARBINARY(5))")
+        self.validate_all(
+            "CREATE TABLE t (foo BLOB)",
+            write={
+                "mysql": "CREATE TABLE t (foo BLOB)",
+                "oracle": "CREATE TABLE t (foo BLOB)",
+                "postgres": "CREATE TABLE t (foo BYTEA)",
+                "tsql": "CREATE TABLE t (foo VARBINARY)",
+                "sqlite": "CREATE TABLE t (foo BLOB)",
+                "duckdb": "CREATE TABLE t (foo VARBINARY)",
+                "hive": "CREATE TABLE t (foo BINARY)",
+                "bigquery": "CREATE TABLE t (foo BYTES)",
+                "redshift": "CREATE TABLE t (foo VARBYTE)",
+                "clickhouse": "CREATE TABLE t (foo Nullable(String))",
             },
         )
 
@@ -296,6 +435,20 @@ class TestMySQL(Validator):
                 "mysql": r"'a '' b '' '",
                 "spark": r"'a \' b \' '",
             },
+        )
+
+        self.validate_identity(
+            r"'\"'",
+            """\'"\'""",
+        )
+        self.validate_identity("'\\\\\"a'")
+        self.validate_identity(
+            "'\t'",
+            "'\\t'",
+        )
+        self.validate_identity(
+            r"'\j'",
+            "'j'",
         )
 
     def test_introducers(self):
@@ -329,45 +482,45 @@ class TestMySQL(Validator):
 
     def test_hexadecimal_literal(self):
         write_CC = {
-            "bigquery": "SELECT 0xCC",
-            "clickhouse": "SELECT 0xCC",
-            "databricks": "SELECT 204",
+            "bigquery": "SELECT FROM_HEX('CC')",
+            "clickhouse": UnsupportedError,
+            "databricks": "SELECT X'CC'",
             "drill": "SELECT 204",
-            "duckdb": "SELECT 204",
+            "duckdb": "SELECT UNHEX('CC')",
             "hive": "SELECT 204",
             "mysql": "SELECT x'CC'",
             "oracle": "SELECT 204",
             "postgres": "SELECT x'CC'",
-            "presto": "SELECT 204",
+            "presto": "SELECT x'CC'",
             "redshift": "SELECT 204",
             "snowflake": "SELECT x'CC'",
             "spark": "SELECT X'CC'",
             "sqlite": "SELECT x'CC'",
             "starrocks": "SELECT x'CC'",
             "tableau": "SELECT 204",
-            "teradata": "SELECT 204",
-            "trino": "SELECT X'CC'",
+            "teradata": "SELECT X'CC'",
+            "trino": "SELECT x'CC'",
             "tsql": "SELECT 0xCC",
         }
         write_CC_with_leading_zeros = {
-            "bigquery": "SELECT 0x0000CC",
-            "clickhouse": "SELECT 0x0000CC",
-            "databricks": "SELECT 204",
+            "bigquery": "SELECT FROM_HEX('0000CC')",
+            "clickhouse": UnsupportedError,
+            "databricks": "SELECT X'0000CC'",
             "drill": "SELECT 204",
-            "duckdb": "SELECT 204",
+            "duckdb": "SELECT UNHEX('0000CC')",
             "hive": "SELECT 204",
             "mysql": "SELECT x'0000CC'",
             "oracle": "SELECT 204",
             "postgres": "SELECT x'0000CC'",
-            "presto": "SELECT 204",
+            "presto": "SELECT x'0000CC'",
             "redshift": "SELECT 204",
             "snowflake": "SELECT x'0000CC'",
             "spark": "SELECT X'0000CC'",
             "sqlite": "SELECT x'0000CC'",
             "starrocks": "SELECT x'0000CC'",
             "tableau": "SELECT 204",
-            "teradata": "SELECT 204",
-            "trino": "SELECT X'0000CC'",
+            "teradata": "SELECT X'0000CC'",
+            "trino": "SELECT x'0000CC'",
             "tsql": "SELECT 0x0000CC",
         }
 
@@ -423,6 +576,9 @@ class TestMySQL(Validator):
             write={
                 "mysql": "CAST(x AS CHAR CHARACTER SET latin1)",
             },
+        )
+        self.validate_identity(
+            "CONVERT('a' USING binary)", "CAST('a' AS CHAR CHARACTER SET binary)"
         )
 
     def test_match_against(self):
@@ -505,9 +661,16 @@ class TestMySQL(Validator):
             },
         )
         self.validate_all(
-            "SELECT DATE_FORMAT('2009-10-04 22:23:00', '%W %M %Y')",
+            "SELECT DATE_FORMAT('2024-08-22 14:53:12', '%a')",
             write={
-                "mysql": "SELECT DATE_FORMAT('2009-10-04 22:23:00', '%W %M %Y')",
+                "mysql": "SELECT DATE_FORMAT('2024-08-22 14:53:12', '%a')",
+                "snowflake": "SELECT TO_CHAR(CAST('2024-08-22 14:53:12' AS TIMESTAMP), 'DY')",
+            },
+        )
+        self.validate_all(
+            "SELECT DATE_FORMAT('2009-10-04 22:23:00', '%a %M %Y')",
+            write={
+                "mysql": "SELECT DATE_FORMAT('2009-10-04 22:23:00', '%a %M %Y')",
                 "snowflake": "SELECT TO_CHAR(CAST('2009-10-04 22:23:00' AS TIMESTAMP), 'DY mmmm yyyy')",
             },
         )
@@ -521,7 +684,7 @@ class TestMySQL(Validator):
         self.validate_all(
             "SELECT DATE_FORMAT('1900-10-04 22:23:00', '%d %y %a %d %m %b')",
             write={
-                "mysql": "SELECT DATE_FORMAT('1900-10-04 22:23:00', '%d %y %W %d %m %b')",
+                "mysql": "SELECT DATE_FORMAT('1900-10-04 22:23:00', '%d %y %a %d %m %b')",
                 "snowflake": "SELECT TO_CHAR(CAST('1900-10-04 22:23:00' AS TIMESTAMP), 'DD yy DY DD mm mon')",
             },
         )
@@ -606,7 +769,82 @@ class TestMySQL(Validator):
             },
         )
 
+        # No timezone, make sure DATETIME captures the correct precision
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15.123456+00:00')",
+            write_sql="SELECT CAST('2023-01-01 13:14:15.123456+00:00' AS DATETIME(6))",
+        )
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15.123+00:00')",
+            write_sql="SELECT CAST('2023-01-01 13:14:15.123+00:00' AS DATETIME(3))",
+        )
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15+00:00')",
+            write_sql="SELECT CAST('2023-01-01 13:14:15+00:00' AS DATETIME)",
+        )
+
+        # With timezone, make sure the TIMESTAMP constructor is used
+        # also TIMESTAMP doesnt have the subsecond precision truncation issue that DATETIME does so we dont need to TIMESTAMP(6)
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15-08:00', 'America/Los_Angeles')",
+            write_sql="SELECT TIMESTAMP('2023-01-01 13:14:15-08:00')",
+        )
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15-08:00', 'America/Los_Angeles')",
+            write_sql="SELECT TIMESTAMP('2023-01-01 13:14:15-08:00')",
+        )
+
+    @unittest.skipUnless(
+        sys.version_info >= (3, 11),
+        "Python 3.11 relaxed datetime.fromisoformat() parsing with regards to microseconds",
+    )
+    def test_mysql_time_python311(self):
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15.12345+00:00')",
+            write_sql="SELECT CAST('2023-01-01 13:14:15.12345+00:00' AS DATETIME(6))",
+        )
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15.1234+00:00')",
+            write_sql="SELECT CAST('2023-01-01 13:14:15.1234+00:00' AS DATETIME(6))",
+        )
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15.12+00:00')",
+            write_sql="SELECT CAST('2023-01-01 13:14:15.12+00:00' AS DATETIME(3))",
+        )
+        self.validate_identity(
+            "SELECT TIME_STR_TO_TIME('2023-01-01 13:14:15.1+00:00')",
+            write_sql="SELECT CAST('2023-01-01 13:14:15.1+00:00' AS DATETIME(3))",
+        )
+
     def test_mysql(self):
+        for func in ("CHAR_LENGTH", "CHARACTER_LENGTH"):
+            with self.subTest(f"Testing MySQL's {func}"):
+                self.validate_all(
+                    f"SELECT {func}('foo')",
+                    write={
+                        "duckdb": "SELECT LENGTH('foo')",
+                        "mysql": "SELECT CHAR_LENGTH('foo')",
+                        "postgres": "SELECT LENGTH('foo')",
+                    },
+                )
+
+        self.validate_all(
+            "CURDATE()",
+            write={
+                "mysql": "CURRENT_DATE",
+                "postgres": "CURRENT_DATE",
+            },
+        )
+        self.validate_all(
+            "SELECT CONCAT('11', '22')",
+            read={
+                "postgres": "SELECT '11' || '22'",
+            },
+            write={
+                "mysql": "SELECT CONCAT('11', '22')",
+                "postgres": "SELECT '11' || '22'",
+            },
+        )
         self.validate_all(
             "SELECT department, GROUP_CONCAT(name) AS employee_names FROM data GROUP BY department",
             read={
@@ -641,16 +879,28 @@ class TestMySQL(Validator):
             },
         )
         self.validate_all(
-            "SELECT * FROM x LEFT JOIN y ON x.id = y.id UNION SELECT * FROM x RIGHT JOIN y ON x.id = y.id LIMIT 0",
+            "SELECT * FROM x LEFT JOIN y ON x.id = y.id UNION ALL SELECT * FROM x RIGHT JOIN y ON x.id = y.id WHERE NOT EXISTS(SELECT 1 FROM x WHERE x.id = y.id) ORDER BY 1 LIMIT 0",
             read={
-                "postgres": "SELECT * FROM x FULL JOIN y ON x.id = y.id LIMIT 0",
+                "postgres": "SELECT * FROM x FULL JOIN y ON x.id = y.id ORDER BY 1 LIMIT 0",
             },
         )
         self.validate_all(
             # MySQL doesn't support FULL OUTER joins
-            "WITH t1 AS (SELECT 1) SELECT * FROM t1 LEFT OUTER JOIN t2 ON t1.x = t2.x UNION SELECT * FROM t1 RIGHT OUTER JOIN t2 ON t1.x = t2.x",
+            "SELECT * FROM t1 LEFT OUTER JOIN t2 ON t1.x = t2.x UNION ALL SELECT * FROM t1 RIGHT OUTER JOIN t2 ON t1.x = t2.x WHERE NOT EXISTS(SELECT 1 FROM t1 WHERE t1.x = t2.x)",
             read={
-                "postgres": "WITH t1 AS (SELECT 1) SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.x = t2.x",
+                "postgres": "SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.x = t2.x",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM t1 LEFT OUTER JOIN t2 USING (x) UNION ALL SELECT * FROM t1 RIGHT OUTER JOIN t2 USING (x) WHERE NOT EXISTS(SELECT 1 FROM t1 WHERE t1.x = t2.x)",
+            read={
+                "postgres": "SELECT * FROM t1 FULL OUTER JOIN t2 USING (x) ",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM t1 LEFT OUTER JOIN t2 USING (x, y) UNION ALL SELECT * FROM t1 RIGHT OUTER JOIN t2 USING (x, y) WHERE NOT EXISTS(SELECT 1 FROM t1 WHERE t1.x = t2.x AND t1.y = t2.y)",
+            read={
+                "postgres": "SELECT * FROM t1 FULL OUTER JOIN t2 USING (x, y) ",
             },
         )
         self.validate_all(
@@ -742,6 +992,7 @@ class TestMySQL(Validator):
                 "mysql": "GROUP_CONCAT(DISTINCT x ORDER BY y DESC SEPARATOR ',')",
                 "sqlite": "GROUP_CONCAT(DISTINCT x)",
                 "tsql": "STRING_AGG(x, ',') WITHIN GROUP (ORDER BY y DESC)",
+                "databricks": "LISTAGG(DISTINCT x, ',') WITHIN GROUP (ORDER BY y DESC)",
                 "postgres": "STRING_AGG(DISTINCT x, ',' ORDER BY y DESC NULLS LAST)",
             },
         )
@@ -751,6 +1002,7 @@ class TestMySQL(Validator):
                 "mysql": "GROUP_CONCAT(x ORDER BY y SEPARATOR z)",
                 "sqlite": "GROUP_CONCAT(x, z)",
                 "tsql": "STRING_AGG(x, z) WITHIN GROUP (ORDER BY y)",
+                "databricks": "LISTAGG(x, z) WITHIN GROUP (ORDER BY y)",
                 "postgres": "STRING_AGG(x, z ORDER BY y NULLS FIRST)",
             },
         )
@@ -760,6 +1012,7 @@ class TestMySQL(Validator):
                 "mysql": "GROUP_CONCAT(DISTINCT x ORDER BY y DESC SEPARATOR '')",
                 "sqlite": "GROUP_CONCAT(DISTINCT x, '')",
                 "tsql": "STRING_AGG(x, '') WITHIN GROUP (ORDER BY y DESC)",
+                "databricks": "LISTAGG(DISTINCT x, '') WITHIN GROUP (ORDER BY y DESC)",
                 "postgres": "STRING_AGG(DISTINCT x, '' ORDER BY y DESC NULLS LAST)",
             },
         )
@@ -768,8 +1021,9 @@ class TestMySQL(Validator):
             write={
                 "mysql": "GROUP_CONCAT(CONCAT(a, b, c) SEPARATOR ',')",
                 "sqlite": "GROUP_CONCAT(a || b || c, ',')",
-                "tsql": "STRING_AGG(CONCAT(a, b, c), ',')",
-                "postgres": "STRING_AGG(CONCAT(a, b, c), ',')",
+                "tsql": "STRING_AGG(a + b + c, ',')",
+                "postgres": "STRING_AGG(a || b || c, ',')",
+                "databricks": "LISTAGG(CONCAT(a, b, c), ',')",
                 "presto": "ARRAY_JOIN(ARRAY_AGG(CONCAT(CAST(a AS VARCHAR), CAST(b AS VARCHAR), CAST(c AS VARCHAR))), ',')",
             },
         )
@@ -778,8 +1032,9 @@ class TestMySQL(Validator):
             write={
                 "mysql": "GROUP_CONCAT(CONCAT(a, b, c) SEPARATOR '')",
                 "sqlite": "GROUP_CONCAT(a || b || c, '')",
-                "tsql": "STRING_AGG(CONCAT(a, b, c), '')",
-                "postgres": "STRING_AGG(CONCAT(a, b, c), '')",
+                "tsql": "STRING_AGG(a + b + c, '')",
+                "databricks": "LISTAGG(CONCAT(a, b, c), '')",
+                "postgres": "STRING_AGG(a || b || c, '')",
             },
         )
         self.validate_all(
@@ -787,8 +1042,9 @@ class TestMySQL(Validator):
             write={
                 "mysql": "GROUP_CONCAT(DISTINCT CONCAT(a, b, c) SEPARATOR '')",
                 "sqlite": "GROUP_CONCAT(DISTINCT a || b || c, '')",
-                "tsql": "STRING_AGG(CONCAT(a, b, c), '')",
-                "postgres": "STRING_AGG(DISTINCT CONCAT(a, b, c), '')",
+                "tsql": "STRING_AGG(a + b + c, '')",
+                "databricks": "LISTAGG(DISTINCT CONCAT(a, b, c), '')",
+                "postgres": "STRING_AGG(DISTINCT a || b || c, '')",
             },
         )
         self.validate_all(
@@ -796,8 +1052,9 @@ class TestMySQL(Validator):
             write={
                 "mysql": "GROUP_CONCAT(CONCAT(a, b, c) ORDER BY d SEPARATOR '')",
                 "sqlite": "GROUP_CONCAT(a || b || c, '')",
-                "tsql": "STRING_AGG(CONCAT(a, b, c), '') WITHIN GROUP (ORDER BY d)",
-                "postgres": "STRING_AGG(CONCAT(a, b, c), '' ORDER BY d NULLS FIRST)",
+                "tsql": "STRING_AGG(a + b + c, '') WITHIN GROUP (ORDER BY d)",
+                "databricks": "LISTAGG(CONCAT(a, b, c), '') WITHIN GROUP (ORDER BY d)",
+                "postgres": "STRING_AGG(a || b || c, '' ORDER BY d NULLS FIRST)",
             },
         )
         self.validate_all(
@@ -805,8 +1062,9 @@ class TestMySQL(Validator):
             write={
                 "mysql": "GROUP_CONCAT(DISTINCT CONCAT(a, b, c) ORDER BY d SEPARATOR '')",
                 "sqlite": "GROUP_CONCAT(DISTINCT a || b || c, '')",
-                "tsql": "STRING_AGG(CONCAT(a, b, c), '') WITHIN GROUP (ORDER BY d)",
-                "postgres": "STRING_AGG(DISTINCT CONCAT(a, b, c), '' ORDER BY d NULLS FIRST)",
+                "tsql": "STRING_AGG(a + b + c, '') WITHIN GROUP (ORDER BY d)",
+                "databricks": "LISTAGG(DISTINCT CONCAT(a, b, c), '') WITHIN GROUP (ORDER BY d)",
+                "postgres": "STRING_AGG(DISTINCT a || b || c, '' ORDER BY d NULLS FIRST)",
             },
         )
         self.validate_identity(
@@ -1133,21 +1391,157 @@ COMMENT='客户账户表'"""
         )
 
     def test_timestamp_trunc(self):
-        for dialect in ("postgres", "snowflake", "duckdb", "spark", "databricks"):
+        hive_dialects = ("spark", "databricks")
+        for dialect in ("postgres", "snowflake", *hive_dialects):
             for unit in (
-                "MILLISECOND",
                 "SECOND",
                 "DAY",
                 "MONTH",
                 "YEAR",
             ):
                 with self.subTest(f"MySQL -> {dialect} Timestamp Trunc with unit {unit}: "):
+                    cast = (
+                        "TIMESTAMP('2001-02-16 20:38:40')"
+                        if dialect in hive_dialects
+                        else "CAST('2001-02-16 20:38:40' AS DATETIME)"
+                    )
                     self.validate_all(
-                        f"DATE_ADD('0000-01-01 00:00:00', INTERVAL (TIMESTAMPDIFF({unit}, '0000-01-01 00:00:00', CAST('2001-02-16 20:38:40' AS DATETIME))) {unit})",
+                        f"DATE_ADD('0000-01-01 00:00:00', INTERVAL (TIMESTAMPDIFF({unit}, '0000-01-01 00:00:00', {cast})) {unit})",
                         read={
                             dialect: f"DATE_TRUNC({unit}, TIMESTAMP '2001-02-16 20:38:40')",
                         },
                         write={
-                            "mysql": f"DATE_ADD('0000-01-01 00:00:00', INTERVAL (TIMESTAMPDIFF({unit}, '0000-01-01 00:00:00', CAST('2001-02-16 20:38:40' AS DATETIME))) {unit})",
+                            "mysql": f"DATE_ADD('0000-01-01 00:00:00', INTERVAL (TIMESTAMPDIFF({unit}, '0000-01-01 00:00:00', {cast})) {unit})",
                         },
                     )
+
+    def test_at_time_zone(self):
+        with self.assertLogs() as cm:
+            # Check AT TIME ZONE doesnt discard the column name and also raises a warning
+            self.validate_identity(
+                "SELECT foo AT TIME ZONE 'UTC'",
+                write_sql="SELECT foo",
+            )
+            assert "AT TIME ZONE is not supported" in cm.output[0]
+
+    def test_json_value(self):
+        json_doc = """'{"item": "shoes", "price": "49.95"}'"""
+        self.validate_identity(f"""SELECT JSON_VALUE({json_doc}, '$.price')""")
+        self.validate_identity(
+            f"""SELECT JSON_VALUE({json_doc}, '$.price' RETURNING DECIMAL(4, 2))"""
+        )
+
+        for on_option in ("NULL", "ERROR", "DEFAULT 1"):
+            self.validate_identity(
+                f"""SELECT JSON_VALUE({json_doc}, '$.price' RETURNING DECIMAL(4, 2) {on_option} ON EMPTY {on_option} ON ERROR) AS price"""
+            )
+
+    def test_grant(self):
+        grant_cmds = [
+            "GRANT 'role1', 'role2' TO 'user1'@'localhost', 'user2'@'localhost'",
+            "GRANT SELECT ON world.* TO 'role3'",
+            "GRANT SELECT ON db2.invoice TO 'jeffrey'@'localhost'",
+            "GRANT INSERT ON `d%`.* TO u",
+            "GRANT ALL ON test.* TO ''@'localhost'",
+            "GRANT SELECT (col1), INSERT (col1, col2) ON mydb.mytbl TO 'someuser'@'somehost'",
+            "GRANT SELECT, INSERT, UPDATE ON *.* TO u2",
+        ]
+
+        for sql in grant_cmds:
+            with self.subTest(f"Testing MySQL's GRANT command statement: {sql}"):
+                self.validate_identity(sql, check_command_warning=True)
+
+    def test_revoke(self):
+        revoke_cmds = [
+            "REVOKE 'role1', 'role2' FROM 'user1'@'localhost', 'user2'@'localhost'",
+            "REVOKE SELECT ON world.* FROM 'role3'",
+            "REVOKE SELECT ON db2.invoice FROM 'jeffrey'@'localhost'",
+            "REVOKE INSERT ON `d%`.* FROM u",
+            "REVOKE ALL ON test.* FROM ''@'localhost'",
+            "REVOKE SELECT (col1), INSERT (col1, col2) ON mydb.mytbl FROM 'someuser'@'somehost'",
+            "REVOKE SELECT, INSERT, UPDATE ON *.* FROM u2",
+        ]
+
+        for sql in revoke_cmds:
+            with self.subTest(f"Testing MySQL's REVOKE command statement: {sql}"):
+                self.validate_identity(sql, check_command_warning=True)
+
+    def test_explain(self):
+        self.validate_identity(
+            "EXPLAIN ANALYZE SELECT * FROM t", "DESCRIBE ANALYZE SELECT * FROM t"
+        )
+
+        expression = self.parse_one("EXPLAIN ANALYZE SELECT * FROM t")
+        self.assertIsInstance(expression, exp.Describe)
+        self.assertEqual(expression.text("style"), "ANALYZE")
+
+        for format in ("JSON", "TRADITIONAL", "TREE"):
+            self.validate_identity(f"DESCRIBE FORMAT={format} UPDATE test SET test_col = 'abc'")
+
+    def test_number_format(self):
+        self.validate_all(
+            "SELECT FORMAT(12332.123456, 4)",
+            write={
+                "duckdb": "SELECT FORMAT('{:,.4f}', 12332.123456)",
+                "mysql": "SELECT FORMAT(12332.123456, 4)",
+            },
+        )
+        self.validate_all(
+            "SELECT FORMAT(12332.1, 4)",
+            write={
+                "duckdb": "SELECT FORMAT('{:,.4f}', 12332.1)",
+                "mysql": "SELECT FORMAT(12332.1, 4)",
+            },
+        )
+        self.validate_all(
+            "SELECT FORMAT(12332.2, 0)",
+            write={
+                "duckdb": "SELECT FORMAT('{:,.0f}', 12332.2)",
+                "mysql": "SELECT FORMAT(12332.2, 0)",
+            },
+        )
+        self.validate_all(
+            "SELECT FORMAT(12332.2, 2, 'de_DE')",
+            write={
+                "duckdb": UnsupportedError,
+                "mysql": "SELECT FORMAT(12332.2, 2, 'de_DE')",
+            },
+        )
+
+    def test_analyze(self):
+        self.validate_identity("ANALYZE LOCAL TABLE tbl")
+        self.validate_identity("ANALYZE NO_WRITE_TO_BINLOG TABLE tbl")
+        self.validate_identity("ANALYZE tbl UPDATE HISTOGRAM ON col1")
+        self.validate_identity("ANALYZE tbl UPDATE HISTOGRAM ON col1 USING DATA 'json_data'")
+        self.validate_identity("ANALYZE tbl UPDATE HISTOGRAM ON col1 WITH 5 BUCKETS")
+        self.validate_identity("ANALYZE tbl UPDATE HISTOGRAM ON col1 WITH 5 BUCKETS AUTO UPDATE")
+        self.validate_identity("ANALYZE tbl UPDATE HISTOGRAM ON col1 WITH 5 BUCKETS MANUAL UPDATE")
+        self.validate_identity("ANALYZE tbl DROP HISTOGRAM ON col1")
+
+    def test_utc_time(self):
+        self.validate_identity("UTC_TIME()").assert_is(exp.UtcTime)
+        self.validate_identity("UTC_TIME(6)").assert_is(exp.UtcTime)
+        self.validate_identity("UTC_TIMESTAMP()").assert_is(exp.UtcTimestamp)
+        self.validate_identity("UTC_TIMESTAMP(6)").assert_is(exp.UtcTimestamp)
+
+    def test_mod(self):
+        self.validate_identity("x % y").assert_is(exp.Mod)
+        self.validate_identity("x MOD y", "x % y").assert_is(exp.Mod)
+        self.validate_identity("MOD(x, y)", "x % y").assert_is(exp.Mod)
+
+    def test_valid_interval_units(self):
+        for unit in (
+            "SECOND_MICROSECOND",
+            "MINUTE_MICROSECOND",
+            "MINUTE_SECOND",
+            "HOUR_MICROSECOND",
+            "HOUR_SECOND",
+            "HOUR_MINUTE",
+            "DAY_MICROSECOND",
+            "DAY_SECOND",
+            "DAY_MINUTE",
+            "DAY_HOUR",
+            "YEAR_MONTH",
+        ):
+            with self.subTest(f"Testing INTERVAL unit: {unit}"):
+                self.validate_identity(f"DATE_ADD(base_date, INTERVAL day_interval {unit})")

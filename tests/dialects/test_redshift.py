@@ -1,4 +1,4 @@
-from sqlglot import exp, parse_one, transpile
+from sqlglot import exp, ParseError, parse_one, transpile
 from tests.dialects.test_dialect import Validator
 
 
@@ -6,6 +6,17 @@ class TestRedshift(Validator):
     dialect = "redshift"
 
     def test_redshift(self):
+        self.validate_identity("SELECT COSH(1.5)")
+        self.validate_identity(
+            "ROUND(CAST(a AS DOUBLE PRECISION) / CAST(b AS DOUBLE PRECISION), 2)"
+        )
+        self.validate_all(
+            "SELECT SPLIT_TO_ARRAY('12,345,6789')",
+            write={
+                "postgres": "SELECT STRING_TO_ARRAY('12,345,6789', ',')",
+                "redshift": "SELECT SPLIT_TO_ARRAY('12,345,6789', ',')",
+            },
+        )
         self.validate_all(
             "GETDATE()",
             read={
@@ -20,7 +31,7 @@ class TestRedshift(Validator):
             """SELECT JSON_EXTRACT_PATH_TEXT('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', 'farm', 'barn', 'color')""",
             write={
                 "bigquery": """SELECT JSON_EXTRACT_SCALAR('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', '$.farm.barn.color')""",
-                "databricks": """SELECT GET_JSON_OBJECT('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', '$.farm.barn.color')""",
+                "databricks": """SELECT '{ "farm": {"barn": { "color": "red", "feed stocked": true }}}':farm.barn.color""",
                 "duckdb": """SELECT '{ "farm": {"barn": { "color": "red", "feed stocked": true }}}' ->> '$.farm.barn.color'""",
                 "postgres": """SELECT JSON_EXTRACT_PATH_TEXT('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', 'farm', 'barn', 'color')""",
                 "presto": """SELECT JSON_EXTRACT_SCALAR('{ "farm": {"barn": { "color": "red", "feed stocked": true }}}', '$.farm.barn.color')""",
@@ -33,11 +44,16 @@ class TestRedshift(Validator):
             "LISTAGG(sellerid, ', ')",
             read={
                 "duckdb": "STRING_AGG(sellerid, ', ')",
+                "databricks": "STRING_AGG(sellerid, ', ')",
             },
             write={
-                # GROUP_CONCAT and STRING_AGG are aliases in DuckDB
-                "duckdb": "GROUP_CONCAT(sellerid, ', ')",
+                # GROUP_CONCAT, LISTAGG and STRING_AGG are aliases in DuckDB
+                "duckdb": "LISTAGG(sellerid, ', ')",
                 "redshift": "LISTAGG(sellerid, ', ')",
+                "spark, version=3.0.0": "ARRAY_JOIN(COLLECT_LIST(sellerid), ', ')",
+                "spark, version=4.0.0": "LISTAGG(sellerid, ', ')",
+                "spark": "LISTAGG(sellerid, ', ')",
+                "databricks": "LISTAGG(sellerid, ', ')",
             },
         )
         self.validate_all(
@@ -207,6 +223,12 @@ class TestRedshift(Validator):
             },
         )
         self.validate_all(
+            "CREATE TABLE a (b BINARY VARYING(10))",
+            write={
+                "redshift": "CREATE TABLE a (b VARBYTE(10))",
+            },
+        )
+        self.validate_all(
             "SELECT 'abc'::CHARACTER",
             write={
                 "redshift": "SELECT CAST('abc' AS CHAR)",
@@ -215,32 +237,33 @@ class TestRedshift(Validator):
         self.validate_all(
             "SELECT DISTINCT ON (a) a, b FROM x ORDER BY c DESC",
             write={
-                "bigquery": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "databricks": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "drill": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "hive": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "mysql": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY CASE WHEN c IS NULL THEN 1 ELSE 0 END DESC, c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "oracle": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) _t WHERE _row_number = 1",
-                "presto": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "redshift": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "snowflake": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "spark": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "sqlite": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "starrocks": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY CASE WHEN c IS NULL THEN 1 ELSE 0 END DESC, c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "tableau": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "teradata": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
-                "trino": "SELECT a, b FROM (SELECT a, b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "bigquery": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "databricks": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "drill": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "hive": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "mysql": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY CASE WHEN c IS NULL THEN 1 ELSE 0 END DESC, c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "oracle": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) AS _row_number FROM x) _t WHERE _row_number = 1",
+                "presto": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "redshift": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "snowflake": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "spark": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "sqlite": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "starrocks": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY CASE WHEN c IS NULL THEN 1 ELSE 0 END DESC, c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "tableau": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "teradata": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
+                "trino": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY c DESC NULLS FIRST) AS _row_number FROM x) AS _t WHERE _row_number = 1",
                 "tsql": "SELECT a, b FROM (SELECT a AS a, b AS b, ROW_NUMBER() OVER (PARTITION BY a ORDER BY CASE WHEN c IS NULL THEN 1 ELSE 0 END DESC, c DESC) AS _row_number FROM x) AS _t WHERE _row_number = 1",
             },
         )
         self.validate_all(
             "DECODE(x, a, b, c, d)",
             write={
-                "": "CASE WHEN x = a OR (x IS NULL AND a IS NULL) THEN b WHEN x = c OR (x IS NULL AND c IS NULL) THEN d END",
-                "oracle": "CASE WHEN x = a OR (x IS NULL AND a IS NULL) THEN b WHEN x = c OR (x IS NULL AND c IS NULL) THEN d END",
-                "redshift": "CASE WHEN x = a OR (x IS NULL AND a IS NULL) THEN b WHEN x = c OR (x IS NULL AND c IS NULL) THEN d END",
-                "snowflake": "CASE WHEN x = a OR (x IS NULL AND a IS NULL) THEN b WHEN x = c OR (x IS NULL AND c IS NULL) THEN d END",
-                "spark": "CASE WHEN x = a OR (x IS NULL AND a IS NULL) THEN b WHEN x = c OR (x IS NULL AND c IS NULL) THEN d END",
+                "": "DECODE(x, a, b, c, d)",
+                "duckdb": "CASE WHEN x = a OR (x IS NULL AND a IS NULL) THEN b WHEN x = c OR (x IS NULL AND c IS NULL) THEN d END",
+                "oracle": "DECODE(x, a, b, c, d)",
+                "redshift": "DECODE(x, a, b, c, d)",
+                "snowflake": "DECODE(x, a, b, c, d)",
+                "spark": "DECODE(x, a, b, c, d)",
             },
         )
         self.validate_all(
@@ -251,6 +274,12 @@ class TestRedshift(Validator):
                 "postgres": "COALESCE(a, b, c, d)",
             },
         )
+
+        self.validate_identity(
+            "DATEDIFF(days, a, b)",
+            "DATEDIFF(DAY, a, b)",
+        )
+
         self.validate_all(
             "DATEDIFF('day', a, b)",
             write={
@@ -273,6 +302,9 @@ class TestRedshift(Validator):
                 "redshift": "SELECT DATEADD(MONTH, 18, '2008-02-28')",
                 "snowflake": "SELECT DATEADD(MONTH, 18, CAST('2008-02-28' AS TIMESTAMP))",
                 "tsql": "SELECT DATEADD(MONTH, 18, CAST('2008-02-28' AS DATETIME2))",
+                "spark": "SELECT DATE_ADD(MONTH, 18, '2008-02-28')",
+                "spark2": "SELECT ADD_MONTHS('2008-02-28', 18)",
+                "databricks": "SELECT DATE_ADD(MONTH, 18, '2008-02-28')",
             },
         )
         self.validate_all(
@@ -289,7 +321,20 @@ class TestRedshift(Validator):
             },
         )
 
+        self.validate_all(
+            "SELECT EXTRACT(EPOCH FROM CURRENT_DATE)",
+            write={
+                "snowflake": "SELECT DATE_PART(EPOCH, CURRENT_DATE)",
+                "redshift": "SELECT EXTRACT(EPOCH FROM CURRENT_DATE)",
+            },
+        )
+
     def test_identity(self):
+        self.validate_identity("SELECT GETBIT(FROM_HEX('4d'), 2)")
+        self.validate_identity("SELECT EXP(1)")
+        self.validate_identity("ALTER TABLE table_name ALTER COLUMN bla TYPE VARCHAR")
+        self.validate_identity("SELECT CAST(value AS FLOAT(8))")
+        self.validate_identity("1 div", "1 AS div")
         self.validate_identity("LISTAGG(DISTINCT foo, ', ')")
         self.validate_identity("CREATE MATERIALIZED VIEW orders AUTO REFRESH YES AS SELECT 1")
         self.validate_identity("SELECT DATEADD(DAY, 1, 'today')")
@@ -304,6 +349,12 @@ class TestRedshift(Validator):
         self.validate_identity("SELECT APPROXIMATE AS y")
         self.validate_identity("CREATE TABLE t (c BIGINT IDENTITY(0, 1))")
         self.validate_identity(
+            "COPY test_staging_tbl FROM 's3://your/bucket/prefix/here' IAM_ROLE default FORMAT AS AVRO 'auto'"
+        )
+        self.validate_identity(
+            "COPY test_staging_tbl FROM 's3://your/bucket/prefix/here' IAM_ROLE default FORMAT AS JSON 's3://jsonpaths_file'"
+        )
+        self.validate_identity(
             "SELECT * FROM venue WHERE (venuecity, venuestate) IN (('Miami', 'FL'), ('Tampa', 'FL')) ORDER BY venueid"
         )
         self.validate_identity(
@@ -312,6 +363,10 @@ class TestRedshift(Validator):
         self.validate_identity(
             """SELECT JSON_EXTRACT_PATH_TEXT('{"f2":{"f3":1},"f4":{"f5":99,"f6":"star"}', 'f4', 'f6', TRUE)"""
         )
+        self.validate_identity(
+            'DATE_PART(year, "somecol")',
+            'EXTRACT(year FROM "somecol")',
+        ).this.assert_is(exp.Var)
         self.validate_identity(
             "SELECT CONCAT('abc', 'def')",
             "SELECT 'abc' || 'def'",
@@ -405,6 +460,14 @@ ORDER BY
         )
         self.validate_identity("SELECT JSON_PARSE('[]')")
 
+        self.validate_identity("SELECT ARRAY(1, 2, 3)")
+        self.validate_identity("SELECT ARRAY[1, 2, 3]")
+
+        self.validate_identity(
+            """SELECT CONVERT_TIMEZONE('America/New_York', '2024-08-06 09:10:00.000')""",
+            """SELECT CONVERT_TIMEZONE('UTC', 'America/New_York', '2024-08-06 09:10:00.000')""",
+        )
+
     def test_values(self):
         # Test crazy-sized VALUES clause to UNION ALL conversion to ensure we don't get RecursionError
         values = [str(v) for v in range(0, 10000)]
@@ -473,6 +536,10 @@ FROM (
         self.validate_identity("CREATE TABLE table_backup BACKUP YES AS SELECT * FROM event")
         self.validate_identity("CREATE TABLE table_backup (i INTEGER, b VARCHAR) BACKUP NO")
         self.validate_identity("CREATE TABLE table_backup (i INTEGER, b VARCHAR) BACKUP YES")
+        self.validate_identity(
+            "select foo, bar from table_1 minus select foo, bar from table_2",
+            "SELECT foo, bar FROM table_1 EXCEPT SELECT foo, bar FROM table_2",
+        )
 
     def test_create_table_like(self):
         self.validate_identity(
@@ -498,7 +565,25 @@ FROM (
             },
         )
 
-    def test_rename_table(self):
+    def test_alter_table(self):
+        self.validate_identity("ALTER TABLE s.t ALTER SORTKEY (c)")
+        self.validate_identity("ALTER TABLE t ALTER SORTKEY AUTO")
+        self.validate_identity("ALTER TABLE t ALTER SORTKEY NONE")
+        self.validate_identity("ALTER TABLE t ALTER SORTKEY (c1, c2)")
+        self.validate_identity("ALTER TABLE t ALTER SORTKEY (c1, c2)")
+        self.validate_identity("ALTER TABLE t ALTER COMPOUND SORTKEY (c1, c2)")
+        self.validate_identity("ALTER TABLE t ALTER DISTSTYLE ALL")
+        self.validate_identity("ALTER TABLE t ALTER DISTSTYLE EVEN")
+        self.validate_identity("ALTER TABLE t ALTER DISTSTYLE AUTO")
+        self.validate_identity("ALTER TABLE t ALTER DISTSTYLE KEY DISTKEY c")
+        self.validate_identity("ALTER TABLE t SET TABLE PROPERTIES ('a' = '5', 'b' = 'c')")
+        self.validate_identity("ALTER TABLE t SET LOCATION 's3://bucket/folder/'")
+        self.validate_identity("ALTER TABLE t SET FILE FORMAT AVRO")
+        self.validate_identity(
+            "ALTER TABLE t ALTER DISTKEY c",
+            "ALTER TABLE t ALTER DISTSTYLE KEY DISTKEY c",
+        )
+
         self.validate_all(
             "ALTER TABLE db.t1 RENAME TO db.t2",
             write={
@@ -535,12 +620,12 @@ FROM (
         )
 
         ast = parse_one("SELECT * FROM t.t JOIN t.c1 ON c1.c2 = t.c3", read="redshift")
-        ast.args["from"].this.assert_is(exp.Table)
+        ast.args["from_"].this.assert_is(exp.Table)
         ast.args["joins"][0].this.assert_is(exp.Table)
         self.assertEqual(ast.sql("redshift"), "SELECT * FROM t.t JOIN t.c1 ON c1.c2 = t.c3")
 
         ast = parse_one("SELECT * FROM t AS t CROSS JOIN t.c1", read="redshift")
-        ast.args["from"].this.assert_is(exp.Table)
+        ast.args["from_"].this.assert_is(exp.Table)
         ast.args["joins"][0].this.assert_is(exp.Unnest)
         self.assertEqual(ast.sql("redshift"), "SELECT * FROM t AS t CROSS JOIN t.c1")
 
@@ -548,10 +633,104 @@ FROM (
             "SELECT * FROM x AS a, a.b AS c, c.d.e AS f, f.g.h.i.j.k AS l", read="redshift"
         )
         joins = ast.args["joins"]
-        ast.args["from"].this.assert_is(exp.Table)
+        ast.args["from_"].this.assert_is(exp.Table)
         joins[0].this.assert_is(exp.Unnest)
         joins[1].this.assert_is(exp.Unnest)
         joins[2].this.assert_is(exp.Unnest).expressions[0].assert_is(exp.Dot)
         self.assertEqual(
             ast.sql("redshift"), "SELECT * FROM x AS a, a.b AS c, c.d.e AS f, f.g.h.i.j.k AS l"
+        )
+
+    def test_join_markers(self):
+        self.validate_identity(
+            "select a.foo, b.bar, a.baz from a, b where a.baz = b.baz (+)",
+            "SELECT a.foo, b.bar, a.baz FROM a, b WHERE a.baz = b.baz (+)",
+        )
+
+    def test_time(self):
+        self.validate_all(
+            "TIME_TO_STR(a, '%Y-%m-%d %H:%M:%S.%f')",
+            write={"redshift": "TO_CHAR(a, 'YYYY-MM-DD HH24:MI:SS.US')"},
+        )
+
+    def test_grant(self):
+        grant_cmds = [
+            "GRANT SELECT ON ALL TABLES IN SCHEMA qa_tickit TO fred",
+            "GRANT USAGE ON DATASHARE salesshare TO NAMESPACE '13b8833d-17c6-4f16-8fe4-1a018f5ed00d'",
+            "GRANT USAGE FOR SCHEMAS IN DATABASE Sales_db TO ROLE Sales",
+            "GRANT EXECUTE FOR FUNCTIONS IN SCHEMA Sales_schema TO bob",
+            "GRANT SELECT FOR TABLES IN DATABASE Sales_db TO alice WITH GRANT OPTION",
+            "GRANT ALL FOR TABLES IN SCHEMA ShareSchema DATABASE ShareDb TO ROLE Sales",
+            "GRANT ASSUMEROLE ON 'arn:aws:iam::123456789012:role/Redshift-Exfunc' TO reg_user1 FOR EXTERNAL FUNCTION",
+            "GRANT ROLE sample_role1 TO ROLE sample_role2",
+        ]
+
+        for sql in grant_cmds:
+            with self.subTest(f"Testing Redshift's GRANT command statement: {sql}"):
+                self.validate_identity(sql, check_command_warning=True)
+
+        self.validate_identity("GRANT SELECT ON TABLE sales TO fred")
+        self.validate_identity("GRANT ALL ON SCHEMA qa_tickit TO GROUP qa_users")
+        self.validate_identity("GRANT ALL ON TABLE qa_tickit.sales TO GROUP qa_users")
+        self.validate_identity(
+            "GRANT ALL ON TABLE qa_tickit.sales TO GROUP qa_users, GROUP ro_users"
+        )
+        self.validate_identity("GRANT ALL ON view_date TO view_user")
+        self.validate_identity(
+            "GRANT SELECT(cust_name, cust_phone), UPDATE(cust_contact_preference) ON cust_profile TO GROUP sales_group"
+        )
+        self.validate_identity(
+            "GRANT ALL(cust_name, cust_phone, cust_contact_preference) ON cust_profile TO GROUP sales_admin"
+        )
+        self.validate_identity("GRANT USAGE ON DATABASE sales_db TO Bob")
+        self.validate_identity("GRANT USAGE ON SCHEMA sales_schema TO ROLE Analyst_role")
+        self.validate_identity("GRANT SELECT ON sales_db.sales_schema.tickit_sales_redshift TO Bob")
+
+    def test_revoke(self):
+        revoke_cmds = [
+            "REVOKE SELECT ON ALL TABLES IN SCHEMA qa_tickit FROM fred",
+            "REVOKE USAGE ON DATASHARE salesshare FROM NAMESPACE '13b8833d-17c6-4f16-8fe4-1a018f5ed00d'",
+            "REVOKE USAGE FOR SCHEMAS IN DATABASE Sales_db FROM ROLE Sales",
+            "REVOKE EXECUTE FOR FUNCTIONS IN SCHEMA Sales_schema FROM bob",
+            "REVOKE SELECT FOR TABLES IN DATABASE Sales_db FROM alice",
+            "REVOKE ROLE sample_role1 FROM ROLE sample_role2",
+        ]
+
+        for sql in revoke_cmds:
+            with self.subTest(f"Testing Redshift's REVOKE command statement: {sql}"):
+                self.validate_identity(sql, check_command_warning=True)
+
+        self.validate_identity("REVOKE SELECT ON TABLE sales FROM fred")
+        self.validate_identity("REVOKE ALL ON SCHEMA qa_tickit FROM GROUP qa_users")
+        self.validate_identity("REVOKE USAGE ON DATABASE sales_db FROM Bob")
+        self.validate_identity("REVOKE USAGE ON SCHEMA sales_schema FROM ROLE Analyst_role")
+
+    def test_analyze(self):
+        self.validate_identity("ANALYZE TBL(col1, col2)")
+        self.validate_identity("ANALYZE VERBOSE TBL")
+        self.validate_identity("ANALYZE TBL PREDICATE COLUMNS")
+        self.validate_identity("ANALYZE TBL ALL COLUMNS")
+
+    def test_cast(self):
+        self.validate_identity('1::"int"', "CAST(1 AS INTEGER)").to.is_type(exp.DataType.Type.INT)
+
+        with self.assertRaises(ParseError):
+            parse_one('1::"udt"', read="redshift")
+
+    def test_fetch_to_limit(self):
+        self.validate_all(
+            "SELECT * FROM t FETCH FIRST 1 ROWS ONLY",
+            write={
+                "redshift": "SELECT * FROM t LIMIT 1",
+                "postgres": "SELECT * FROM t FETCH FIRST 1 ROWS ONLY",
+            },
+        )
+
+    def test_regexp_extract(self):
+        self.validate_all(
+            "SELECT REGEXP_SUBSTR(abc, 'pattern(group)', 2) FROM table",
+            write={
+                "redshift": '''SELECT REGEXP_SUBSTR(abc, 'pattern(group)', 2) FROM "table"''',
+                "duckdb": '''SELECT REGEXP_EXTRACT(SUBSTRING(abc, 2), 'pattern(group)') FROM "table"''',
+            },
         )

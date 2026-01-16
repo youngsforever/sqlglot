@@ -1,6 +1,6 @@
 from sqlglot import exp
 from sqlglot.helper import name_sequence
-from sqlglot.optimizer.scope import ScopeType, traverse_scope
+from sqlglot.optimizer.scope import ScopeType, find_in_scope, traverse_scope
 
 
 def unnest_subqueries(expression):
@@ -43,12 +43,18 @@ def unnest(select, parent_select, next_alias_name):
     predicate = select.find_ancestor(exp.Condition)
     if (
         not predicate
+        # Do not unnest subqueries inside table-valued functions such as
+        # FROM GENERATE_SERIES(...), FROM UNNEST(...) etc in order to preserve join order
+        or (
+            isinstance(predicate, exp.Func)
+            and isinstance(predicate.parent, (exp.Table, exp.From, exp.Join))
+        )
         or parent_select is not predicate.parent_select
-        or not parent_select.args.get("from")
+        or not parent_select.args.get("from_")
     ):
         return
 
-    if isinstance(select, exp.Union):
+    if isinstance(select, exp.SetOperation):
         select = exp.select(*select.selects).from_(select.subquery(next_alias_name()))
 
     alias = next_alias_name()
@@ -64,15 +70,26 @@ def unnest(select, parent_select, next_alias_name):
             (not clause or clause_parent_select is not parent_select)
             and (
                 parent_select.args.get("group")
-                or any(projection.find(exp.AggFunc) for projection in parent_select.selects)
+                or any(find_in_scope(select, exp.AggFunc) for select in parent_select.selects)
             )
         ):
             column = exp.Max(this=column)
         elif not isinstance(select.parent, exp.Subquery):
             return
 
+        join_type = "CROSS"
+        on_clause = None
+        if isinstance(predicate, exp.Exists):
+            # If a subquery returns no rows, cross-joining against it incorrectly eliminates all rows
+            # from the parent query. Therefore, we use a LEFT JOIN that always matches (ON TRUE), then
+            # check for non-NULL column values to determine whether the subquery contained rows.
+            column = column.is_(exp.null()).not_()
+            join_type = "LEFT"
+            on_clause = exp.true()
+
         _replace(select.parent, column)
-        parent_select.join(select, join_type="CROSS", join_alias=alias, copy=False)
+        parent_select.join(select, on=on_clause, join_type=join_type, join_alias=alias, copy=False)
+
         return
 
     if select.find(exp.Limit, exp.Offset):
@@ -101,11 +118,11 @@ def unnest(select, parent_select, next_alias_name):
     if group:
         if {value.this} != set(group.expressions):
             select = (
-                exp.select(exp.column(value.alias, "_q"))
+                exp.select(exp.alias_(exp.column(value.alias, "_q"), value.alias))
                 .from_(select.subquery("_q", copy=False), copy=False)
                 .group_by(exp.column(value.alias, "_q"), copy=False)
             )
-    else:
+    elif not find_in_scope(value.this, exp.AggFunc):
         select = select.group_by(value.this, copy=False)
 
     parent_select.join(
@@ -152,7 +169,9 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
         return
 
     is_subquery_projection = any(
-        node is select.parent for node in parent_select.selects if isinstance(node, exp.Subquery)
+        node is select.parent
+        for node in map(lambda s: s.unalias(), parent_select.selects)
+        if isinstance(node, exp.Subquery)
     )
 
     value = select.selects[0]
@@ -187,7 +206,7 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
     # exists queries should not have any selects as it only checks if there are any rows
     # all selects will be added by the optimizer and only used for join keys
     if isinstance(parent_predicate, exp.Exists):
-        select.args["expressions"] = []
+        select.set("expressions", [])
 
     for key, alias in key_aliases.items():
         if key in group_by:
@@ -200,19 +219,25 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
 
     alias = exp.column(value.alias, table_alias)
     other = _other_operand(parent_predicate)
+    op_type = type(parent_predicate.parent) if parent_predicate else None
 
     if isinstance(parent_predicate, exp.Exists):
         alias = exp.column(list(key_aliases.values())[0], table_alias)
         parent_predicate = _replace(parent_predicate, f"NOT {alias} IS NULL")
     elif isinstance(parent_predicate, exp.All):
+        assert issubclass(op_type, exp.Binary)
+        predicate = op_type(this=other, expression=exp.column("_x"))
         parent_predicate = _replace(
-            parent_predicate.parent, f"ARRAY_ALL({alias}, _x -> _x = {other})"
+            parent_predicate.parent, f"ARRAY_ALL({alias}, _x -> {predicate})"
         )
     elif isinstance(parent_predicate, exp.Any):
+        assert issubclass(op_type, exp.Binary)
         if value.this in group_by:
-            parent_predicate = _replace(parent_predicate.parent, f"{other} = {alias}")
+            predicate = op_type(this=other, expression=alias)
+            parent_predicate = _replace(parent_predicate.parent, predicate)
         else:
-            parent_predicate = _replace(parent_predicate, f"ARRAY_ANY({alias}, _x -> _x = {other})")
+            predicate = op_type(this=other, expression=exp.column("_x"))
+            parent_predicate = _replace(parent_predicate, f"ARRAY_ANY({alias}, _x -> {predicate})")
     elif isinstance(parent_predicate, exp.In):
         if value.this in group_by:
             parent_predicate = _replace(parent_predicate, f"{other} = {alias}")
@@ -222,7 +247,7 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
                 f"ARRAY_ANY({alias}, _x -> _x = {parent_predicate.this})",
             )
     else:
-        if is_subquery_projection:
+        if is_subquery_projection and select.parent.alias:
             alias = exp.alias_(alias, select.parent.alias)
 
         # COUNT always returns 0 on empty datasets, so we need take that into consideration here
@@ -236,10 +261,7 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
                     return exp.null()
                 return node
 
-            alias = exp.Coalesce(
-                this=alias,
-                expressions=[value.this.transform(remove_aggs)],
-            )
+            alias = exp.Coalesce(this=alias, expressions=[value.this.transform(remove_aggs)])
 
         select.parent.replace(alias)
 
@@ -249,6 +271,8 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
 
         if is_subquery_projection:
             key.replace(nested)
+            if not isinstance(predicate, exp.EQ):
+                parent_select.where(predicate, copy=False)
             continue
 
         if key in group_by:

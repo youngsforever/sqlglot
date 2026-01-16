@@ -1,4 +1,10 @@
+from datetime import date, datetime, timezone
 from sqlglot import exp, parse_one
+from sqlglot.dialects import ClickHouse
+from sqlglot.expressions import convert
+from sqlglot.helper import logger as helper_logger
+from sqlglot.optimizer import traverse_scope
+from sqlglot.optimizer.qualify_columns import quote_identifiers
 from tests.dialects.test_dialect import Validator
 from sqlglot.errors import ErrorLevel
 
@@ -7,48 +13,50 @@ class TestClickhouse(Validator):
     dialect = "clickhouse"
 
     def test_clickhouse(self):
-        self.validate_all(
-            "SELECT * FROM x PREWHERE y = 1 WHERE z = 2",
-            write={
-                "": "SELECT * FROM x WHERE z = 2",
-                "clickhouse": "SELECT * FROM x PREWHERE y = 1 WHERE z = 2",
-            },
-        )
-        self.validate_all(
-            "SELECT * FROM x AS prewhere",
-            read={
-                "clickhouse": "SELECT * FROM x AS prewhere",
-                "duckdb": "SELECT * FROM x prewhere",
-            },
-        )
+        expr = quote_identifiers(self.parse_one("{start_date:String}"), dialect="clickhouse")
+        self.assertEqual(expr.sql("clickhouse"), "{start_date: String}")
 
-        self.validate_identity("SELECT * FROM x LIMIT 1 UNION ALL SELECT * FROM y")
+        for string_type_enum in ClickHouse.Generator.STRING_TYPE_MAPPING:
+            self.validate_identity(f"CAST(x AS {string_type_enum.value})", "CAST(x AS String)")
 
-        string_types = [
-            "BLOB",
-            "LONGBLOB",
-            "LONGTEXT",
-            "MEDIUMBLOB",
-            "MEDIUMTEXT",
-            "TINYBLOB",
-            "TINYTEXT",
-            "VARCHAR(255)",
-        ]
+        # Arrays, maps and tuples can't be Nullable in ClickHouse
+        for non_nullable_type in ("ARRAY<INT>", "MAP<INT, INT>", "STRUCT(a: INT)"):
+            try_cast = parse_one(f"TRY_CAST(x AS {non_nullable_type})")
+            target_type = try_cast.to.sql("clickhouse")
+            self.assertEqual(try_cast.sql("clickhouse"), f"CAST(x AS {target_type})")
 
-        for string_type in string_types:
-            self.validate_identity(f"CAST(x AS {string_type})", "CAST(x AS String)")
+        for nullable_type in ("INT", "UINT", "BIGINT", "FLOAT", "DOUBLE", "TEXT", "DATE", "UUID"):
+            try_cast = parse_one(f"TRY_CAST(x AS {nullable_type})")
+            target_type = exp.DataType.build(nullable_type, dialect="clickhouse").sql("clickhouse")
+            self.assertEqual(try_cast.sql("clickhouse"), f"CAST(x AS Nullable({target_type}))")
 
         expr = parse_one("count(x)")
         self.assertEqual(expr.sql(dialect="clickhouse"), "COUNT(x)")
-        self.assertIsNone(expr._meta)
 
+        self.validate_identity('SELECT DISTINCT ON ("id") * FROM t')
+        self.validate_identity("SELECT 1 OR (1 = 2)")
+        self.validate_identity("SELECT 1 AND (1 = 2)")
+        self.validate_identity("SELECT json.a.:Int64")
+        self.validate_identity("SELECT json.a.:JSON.b.:Int64")
+        self.validate_identity("WITH arrayJoin([(1, [2, 3])]) AS arr SELECT arr")
+        self.validate_identity("CAST(1 AS Bool)")
+        self.validate_identity("SELECT toString(CHAR(104.1, 101, 108.9, 108.9, 111, 32))")
+        self.validate_identity("@macro").assert_is(exp.Parameter).this.assert_is(exp.Var)
+        self.validate_identity("SELECT toFloat(like)")
+        self.validate_identity("SELECT like")
+        self.validate_identity("SELECT STR_TO_DATE(str, fmt, tz)")
+        self.validate_identity("SELECT STR_TO_DATE('05 12 2000', '%d %m %Y')")
+        self.validate_identity("SELECT EXTRACT(YEAR FROM toDateTime('2023-02-01'))")
+        self.validate_identity("extract(haystack, pattern)")
+        self.validate_identity("SELECT * FROM x LIMIT 1 UNION ALL SELECT * FROM y")
+        self.validate_identity("SELECT CAST(x AS Tuple(String, Array(Nullable(Float64))))")
         self.validate_identity("countIf(x, y)")
         self.validate_identity("x = y")
         self.validate_identity("x <> y")
         self.validate_identity("SELECT * FROM (SELECT a FROM b SAMPLE 0.01)")
         self.validate_identity("SELECT * FROM (SELECT a FROM b SAMPLE 1 / 10 OFFSET 1 / 2)")
         self.validate_identity("SELECT sum(foo * bar) FROM bla SAMPLE 10000000")
-        self.validate_identity("CAST(x AS Nested(ID UInt32, Serial UInt32, EventTime DATETIME))")
+        self.validate_identity("CAST(x AS Nested(ID UInt32, Serial UInt32, EventTime DateTime))")
         self.validate_identity("CAST(x AS Enum('hello' = 1, 'world' = 2))")
         self.validate_identity("CAST(x AS Enum('hello', 'world'))")
         self.validate_identity("CAST(x AS Enum('hello' = 1, 'world'))")
@@ -84,26 +92,40 @@ class TestClickhouse(Validator):
         self.validate_identity("SELECT histogram(5)(a)")
         self.validate_identity("SELECT groupUniqArray(2)(a)")
         self.validate_identity("SELECT exponentialTimeDecayedAvg(60)(a, b)")
+        self.validate_identity("levenshteinDistance(col1, col2)", "editDistance(col1, col2)")
         self.validate_identity("SELECT * FROM foo WHERE x GLOBAL IN (SELECT * FROM bar)")
-        self.validate_identity("position(haystack, needle)")
-        self.validate_identity("position(haystack, needle, position)")
-        self.validate_identity("CAST(x AS DATETIME)")
+        self.validate_identity("SELECT * FROM foo WHERE x GLOBAL NOT IN (SELECT * FROM bar)")
+        self.validate_identity("POSITION(haystack, needle)")
+        self.validate_identity("POSITION(haystack, needle, position)")
+        self.validate_identity("CAST(x AS DATETIME)", "CAST(x AS DateTime)")
+        self.validate_identity("CAST(x AS TIMESTAMPTZ)", "CAST(x AS DateTime)")
         self.validate_identity("CAST(x as MEDIUMINT)", "CAST(x AS Int32)")
+        self.validate_identity("CAST(x AS DECIMAL(38, 2))", "CAST(x AS Decimal(38, 2))")
         self.validate_identity("SELECT arrayJoin([1, 2, 3] AS src) AS dst, 'Hello', src")
         self.validate_identity("""SELECT JSONExtractString('{"x": {"y": 1}}', 'x', 'y')""")
         self.validate_identity("SELECT * FROM table LIMIT 1 BY a, b")
         self.validate_identity("SELECT * FROM table LIMIT 2 OFFSET 1 BY a, b")
+        self.validate_identity("TRUNCATE TABLE t1 ON CLUSTER test_cluster")
+        self.validate_identity("TRUNCATE TABLE t1 ON CLUSTER '{cluster}'")
+        self.validate_identity("TRUNCATE DATABASE db")
+        self.validate_identity("TRUNCATE DATABASE db ON CLUSTER test_cluster")
+        self.validate_identity("TRUNCATE DATABASE db ON CLUSTER '{cluster}'")
+        self.validate_identity("EXCHANGE TABLES x.a AND y.b", check_command_warning=True)
+        self.validate_identity("CREATE TABLE test (id UInt8) ENGINE=Null()")
+        self.validate_identity(
+            "SELECT * FROM foo ORDER BY bar OFFSET 0 ROWS FETCH NEXT 10 ROWS WITH TIES"
+        )
+        self.validate_identity(
+            "SELECT DATE_BIN(toDateTime('2023-01-01 14:45:00'), INTERVAL '1' MINUTE, toDateTime('2023-01-01 14:35:30'), 'UTC')",
+        )
+        self.validate_identity(
+            "SELECT CAST(1730098800 AS DateTime64) AS DATETIME, 'test' AS interp ORDER BY DATETIME WITH FILL FROM toDateTime64(1730098800, 3) - INTERVAL '7' HOUR TO toDateTime64(1730185140, 3) - INTERVAL '7' HOUR STEP toIntervalSecond(900) INTERPOLATE (interp)"
+        )
+        self.validate_identity(
+            "SELECT number, COUNT() OVER (PARTITION BY number % 3) AS partition_count FROM numbers(10) WINDOW window_name AS (PARTITION BY number) QUALIFY partition_count = 4 ORDER BY number"
+        )
         self.validate_identity(
             "SELECT id, quantileGK(100, 0.95)(reading) OVER (PARTITION BY id ORDER BY id RANGE BETWEEN 30000 PRECEDING AND CURRENT ROW) AS window FROM table"
-        )
-
-        self.validate_identity(
-            "SELECT $1$foo$1$",
-            "SELECT 'foo'",
-        )
-        self.validate_identity(
-            "SELECT * FROM table LIMIT 1, 2 BY a, b",
-            "SELECT * FROM table LIMIT 2 OFFSET 1 BY a, b",
         )
         self.validate_identity(
             "SELECT * FROM table LIMIT 1 BY CONCAT(datalayerVariantNo, datalayerProductId, warehouse)"
@@ -133,10 +155,6 @@ class TestClickhouse(Validator):
             "SELECT sum(1) AS impressions, (arrayJoin(arrayZip(cities, browsers)) AS t).1 AS city, t.2 AS browser FROM (SELECT ['Istanbul', 'Berlin', 'Bobruisk'] AS cities, ['Firefox', 'Chrome', 'Chrome'] AS browsers) GROUP BY 2, 3"
         )
         self.validate_identity(
-            "SELECT SUM(1) AS impressions FROM (SELECT ['Istanbul', 'Berlin', 'Bobruisk'] AS cities) WHERE arrayJoin(cities) IN ['Istanbul', 'Berlin']",
-            "SELECT SUM(1) AS impressions FROM (SELECT ['Istanbul', 'Berlin', 'Bobruisk'] AS cities) WHERE arrayJoin(cities) IN ('Istanbul', 'Berlin')",
-        )
-        self.validate_identity(
             'SELECT CAST(tuple(1 AS "a", 2 AS "b", 3.0 AS "c").2 AS Nullable(String))'
         )
         self.validate_identity(
@@ -146,19 +164,153 @@ class TestClickhouse(Validator):
             "CREATE TABLE test ON CLUSTER default (id UInt8) ENGINE=AggregatingMergeTree() ORDER BY tuple()"
         )
         self.validate_identity(
+            "CREATE TABLE test ON CLUSTER '{cluster}' (id UInt8) ENGINE=AggregatingMergeTree() ORDER BY tuple()"
+        )
+        self.validate_identity(
             "CREATE MATERIALIZED VIEW test_view ON CLUSTER cl1 (id UInt8) ENGINE=AggregatingMergeTree() ORDER BY tuple() AS SELECT * FROM test_data"
         )
         self.validate_identity(
-            "CREATE MATERIALIZED VIEW test_view ON CLUSTER cl1 (id UInt8) TO table1 AS SELECT * FROM test_data"
+            "CREATE MATERIALIZED VIEW test_view ON CLUSTER '{cluster}' (id UInt8) ENGINE=AggregatingMergeTree() ORDER BY tuple() AS SELECT * FROM test_data"
         )
         self.validate_identity(
-            "CREATE MATERIALIZED VIEW test_view (id UInt8) TO db.table1 AS SELECT * FROM test_data"
+            "CREATE MATERIALIZED VIEW test_view ON CLUSTER cl1 TO table1 AS SELECT * FROM test_data"
         )
-        self.validate_identity("TRUNCATE TABLE t1 ON CLUSTER test_cluster")
-        self.validate_identity("TRUNCATE DATABASE db")
-        self.validate_identity("TRUNCATE DATABASE db ON CLUSTER test_cluster")
+        self.validate_identity(
+            "CREATE MATERIALIZED VIEW test_view ON CLUSTER '{cluster}' TO table1 AS SELECT * FROM test_data"
+        )
+        self.validate_identity(
+            "CREATE MATERIALIZED VIEW test_view TO db.table1 (id UInt8) AS SELECT * FROM test_data"
+        )
         self.validate_identity(
             "CREATE TABLE t (foo String CODEC(LZ4HC(9), ZSTD, DELTA), size String ALIAS formatReadableSize(size_bytes), INDEX idx1 a TYPE bloom_filter(0.001) GRANULARITY 1, INDEX idx2 a TYPE set(100) GRANULARITY 2, INDEX idx3 a TYPE minmax GRANULARITY 3)"
+        )
+        self.validate_identity(
+            "SELECT generate_series FROM generate_series(0, 10) AS g(x)",
+        )
+        self.validate_identity(
+            "SELECT t.c FROM (SELECT arrayJoin([1,2,3,4,5]) AS c) AS t WHERE (t.c + 0) NOT IN (1,2)",
+            "SELECT t.c FROM (SELECT arrayJoin([1, 2, 3, 4, 5]) AS c) AS t WHERE NOT ((t.c + 0) IN (1, 2))",
+        )
+        self.validate_identity(
+            "SELECT * FROM t1, t2",
+            "SELECT * FROM t1 CROSS JOIN t2",
+        )
+        self.validate_identity(
+            "SELECT and(1, 2)",
+            "SELECT 1 AND 2",
+        )
+        self.validate_identity(
+            "SELECT or(1, 2)",
+            "SELECT 1 OR 2",
+        )
+        self.validate_identity(
+            "SELECT generate_series FROM generate_series(0, 10) AS g",
+            "SELECT generate_series FROM generate_series(0, 10) AS g(generate_series)",
+        )
+        self.validate_identity(
+            "INSERT INTO tab VALUES ({'key1': 1, 'key2': 10}), ({'key1': 2, 'key2': 20}), ({'key1': 3, 'key2': 30})",
+            "INSERT INTO tab VALUES ((map('key1', 1, 'key2', 10))), ((map('key1', 2, 'key2', 20))), ((map('key1', 3, 'key2', 30)))",
+        )
+        self.validate_identity(
+            "SELECT (toUInt8('1') + toUInt8('2')) IS NOT NULL",
+            "SELECT NOT ((toUInt8('1') + toUInt8('2')) IS NULL)",
+        )
+        self.validate_identity(
+            "SELECT $1$foo$1$",
+            "SELECT 'foo'",
+        )
+        self.validate_identity(
+            "SELECT * FROM table LIMIT 1, 2 BY a, b",
+            "SELECT * FROM table LIMIT 2 OFFSET 1 BY a, b",
+        )
+        self.validate_identity(
+            "SELECT SUM(1) AS impressions FROM (SELECT ['Istanbul', 'Berlin', 'Bobruisk'] AS cities) WHERE arrayJoin(cities) IN ['Istanbul', 'Berlin']",
+            "SELECT SUM(1) AS impressions FROM (SELECT ['Istanbul', 'Berlin', 'Bobruisk'] AS cities) WHERE arrayJoin(cities) IN ('Istanbul', 'Berlin')",
+        )
+
+        self.validate_identity("SELECT SUBSTRING_INDEX(str, delim, count)")
+        self.validate_identity("SELECT SUBSTRING_INDEX('a.b.c.d', '.', 2)")
+        self.validate_identity("SELECT SUBSTRING_INDEX('a.b.c.d', '.', -2)")
+
+        self.validate_all(
+            "SELECT SUBSTRING_INDEX('a.b.c.d', '.', 2)",
+            write={
+                "databricks": "SELECT SUBSTRING_INDEX('a.b.c.d', '.', 2)",
+                "spark": "SELECT SUBSTRING_INDEX('a.b.c.d', '.', 2)",
+                "mysql": "SELECT SUBSTRING_INDEX('a.b.c.d', '.', 2)",
+            },
+        )
+
+        self.validate_all(
+            "SELECT substringIndex('a.b.c.d', '.', 2)",
+            write={
+                "databricks": "SELECT SUBSTRING_INDEX('a.b.c.d', '.', 2)",
+                "spark": "SELECT SUBSTRING_INDEX('a.b.c.d', '.', 2)",
+                "mysql": "SELECT SUBSTRING_INDEX('a.b.c.d', '.', 2)",
+                "clickhouse": "SELECT substringIndex('a.b.c.d', '.', 2)",
+            },
+        )
+
+        self.validate_all(
+            "SELECT CAST(STR_TO_DATE(SUBSTRING(a.eta, 1, 10), '%Y-%m-%d') AS Nullable(DATE))",
+            read={
+                "clickhouse": "SELECT CAST(STR_TO_DATE(SUBSTRING(a.eta, 1, 10), '%Y-%m-%d') AS Nullable(DATE))",
+                "oracle": "SELECT to_date(substr(a.eta, 1,10), 'YYYY-MM-DD')",
+            },
+        )
+
+        self.validate_all(
+            "CHAR(67) || CHAR(65) || CHAR(84)",
+            read={
+                "clickhouse": "CHAR(67) || CHAR(65) || CHAR(84)",
+                "oracle": "CHR(67) || CHR(65) || CHR(84)",
+            },
+        )
+        self.validate_all(
+            "SELECT lagInFrame(salary, 1, 0) OVER (ORDER BY hire_date) AS prev_sal FROM employees",
+            read={
+                "clickhouse": "SELECT lagInFrame(salary, 1, 0) OVER (ORDER BY hire_date) AS prev_sal FROM employees",
+                "oracle": "SELECT LAG(salary, 1, 0) OVER (ORDER BY hire_date) AS prev_sal FROM employees",
+            },
+        )
+        self.validate_all(
+            "SELECT leadInFrame(salary, 1, 0) OVER (ORDER BY hire_date) AS prev_sal FROM employees",
+            read={
+                "clickhouse": "SELECT leadInFrame(salary, 1, 0) OVER (ORDER BY hire_date) AS prev_sal FROM employees",
+                "oracle": "SELECT LEAD(salary, 1, 0) OVER (ORDER BY hire_date) AS prev_sal FROM employees",
+            },
+        )
+        self.validate_all(
+            "SELECT CAST(STR_TO_DATE('05 12 2000', '%d %m %Y') AS Nullable(DATE))",
+            read={
+                "clickhouse": "SELECT CAST(STR_TO_DATE('05 12 2000', '%d %m %Y') AS Nullable(DATE))",
+                "postgres": "SELECT TO_DATE('05 12 2000', 'DD MM YYYY')",
+            },
+            write={
+                "clickhouse": "SELECT CAST(STR_TO_DATE('05 12 2000', '%d %m %Y') AS Nullable(DATE))",
+                "postgres": "SELECT CAST(CAST(TO_DATE('05 12 2000', 'DD MM YYYY') AS TIMESTAMP) AS DATE)",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM x PREWHERE y = 1 WHERE z = 2",
+            write={
+                "": "SELECT * FROM x WHERE z = 2",
+                "clickhouse": "SELECT * FROM x PREWHERE y = 1 WHERE z = 2",
+            },
+        )
+        self.validate_all(
+            "SELECT * FROM x AS prewhere",
+            read={
+                "clickhouse": "SELECT * FROM x AS prewhere",
+                "duckdb": "SELECT * FROM x prewhere",
+            },
+        )
+        self.validate_all(
+            "SELECT a, b FROM (SELECT * FROM x) AS t(a, b)",
+            read={
+                "clickhouse": "SELECT a, b FROM (SELECT * FROM x) AS t(a, b)",
+                "duckdb": "SELECT a, b FROM (SELECT * FROM x) AS t(a, b)",
+            },
         )
         self.validate_all(
             "SELECT arrayJoin([1,2,3])",
@@ -180,10 +332,27 @@ class TestClickhouse(Validator):
             },
         )
         self.validate_all(
-            "SELECT CAST('2020-01-01' AS TIMESTAMP) + INTERVAL '500' MICROSECOND",
+            "has([1], x)",
+            read={
+                "clickhouse": "has([1], x)",
+                "presto": "CONTAINS(ARRAY[1], x)",
+                "spark": "ARRAY_CONTAINS(ARRAY(1), x)",
+            },
+            write={
+                "presto": "CONTAINS(ARRAY[1], x)",
+                "spark": "ARRAY_CONTAINS(ARRAY(1), x)",
+            },
+        )
+        self.validate_all(
+            "SELECT CAST('2020-01-01' AS Nullable(DateTime)) + INTERVAL '500' MICROSECOND",
             read={
                 "duckdb": "SELECT TIMESTAMP '2020-01-01' + INTERVAL '500 us'",
                 "postgres": "SELECT TIMESTAMP '2020-01-01' + INTERVAL '500 us'",
+            },
+            write={
+                "clickhouse": "SELECT CAST('2020-01-01' AS Nullable(DateTime)) + INTERVAL '500' MICROSECOND",
+                "duckdb": "SELECT CAST('2020-01-01' AS TIMESTAMP) + INTERVAL '500' MICROSECOND",
+                "postgres": "SELECT CAST('2020-01-01' AS TIMESTAMP) + INTERVAL '500 MICROSECOND'",
             },
         )
         self.validate_all(
@@ -274,6 +443,7 @@ class TestClickhouse(Validator):
                 "mysql": "SELECT 1 XOR 0 XOR 1",
             },
         )
+        self.validate_identity("SELECT xor(0, 1, 1, 0)")
         self.validate_all(
             "CONCAT(a, b)",
             read={
@@ -282,7 +452,7 @@ class TestClickhouse(Validator):
             },
             write={
                 "mysql": "CONCAT(a, b)",
-                "postgres": "CONCAT(a, b)",
+                "postgres": "a || b",
             },
         )
         self.validate_all(
@@ -324,9 +494,8 @@ class TestClickhouse(Validator):
                 "clickhouse": "SELECT quantileIf(0.5)(a, TRUE)",
             },
         )
-        self.validate_all(
-            "SELECT position(needle IN haystack)",
-            write={"clickhouse": "SELECT position(haystack, needle)"},
+        self.validate_identity(
+            "SELECT POSITION(needle IN haystack)", "SELECT POSITION(haystack, needle)"
         )
         self.validate_identity(
             "SELECT * FROM x LIMIT 10 SETTINGS max_results = 100, result = 'break'"
@@ -362,15 +531,15 @@ class TestClickhouse(Validator):
                 " GROUP BY loyalty ORDER BY loyalty ASC"
             },
         )
-        self.validate_identity("SELECT s, arr FROM arrays_test ARRAY JOIN arr")
-        self.validate_identity("SELECT s, arr, a FROM arrays_test LEFT ARRAY JOIN arr AS a")
-        self.validate_identity(
-            "SELECT s, arr_external FROM arrays_test ARRAY JOIN [1, 2, 3] AS arr_external"
-        )
         self.validate_all(
             "SELECT quantile(0.5)(a)",
-            read={"duckdb": "SELECT quantile(a, 0.5)"},
-            write={"clickhouse": "SELECT quantile(0.5)(a)"},
+            read={
+                "duckdb": "SELECT quantile(a, 0.5)",
+                "clickhouse": "SELECT median(a)",
+            },
+            write={
+                "clickhouse": "SELECT quantile(0.5)(a)",
+            },
         )
         self.validate_all(
             "SELECT quantiles(0.5, 0.4)(a)",
@@ -400,11 +569,12 @@ class TestClickhouse(Validator):
             "INSERT INTO FUNCTION s3('url', 'CSV', 'name String, value UInt32', 'gzip') SELECT name, value FROM existing_table"
         )
         self.validate_identity(
-            "INSERT INTO FUNCTION remote('localhost', default.simple_table) VALUES (100, 'inserted via remote()')"
+            "INSERT INTO FUNCTION remote('localhost', default.simple_table) VALUES (100, 'inserted via remote()')",
+            "INSERT INTO FUNCTION remote('localhost', default.simple_table) VALUES ((100), ('inserted via remote()'))",
         )
         self.validate_identity(
             """INSERT INTO TABLE FUNCTION hdfs('hdfs://hdfs1:9000/test', 'TSV', 'name String, column2 UInt32, column3 UInt32') VALUES ('test', 1, 2)""",
-            """INSERT INTO FUNCTION hdfs('hdfs://hdfs1:9000/test', 'TSV', 'name String, column2 UInt32, column3 UInt32') VALUES ('test', 1, 2)""",
+            """INSERT INTO FUNCTION hdfs('hdfs://hdfs1:9000/test', 'TSV', 'name String, column2 UInt32, column3 UInt32') VALUES (('test'), (1), (2))""",
         )
 
         self.validate_identity("SELECT 1 FORMAT TabSeparated")
@@ -412,16 +582,140 @@ class TestClickhouse(Validator):
         self.validate_identity("SELECT FORMAT")
         self.validate_identity("1 AS FORMAT").assert_is(exp.Alias)
 
-        self.validate_identity("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d', '%T')")
+        self.validate_identity("SELECT formatDateTime(NOW(), '%Y-%m-%d', '%T')")
         self.validate_all(
-            "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d')",
+            "SELECT formatDateTime(NOW(), '%Y-%m-%d')",
             read={
                 "clickhouse": "SELECT formatDateTime(NOW(), '%Y-%m-%d')",
                 "mysql": "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d')",
             },
             write={
-                "clickhouse": "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d')",
+                "clickhouse": "SELECT formatDateTime(NOW(), '%Y-%m-%d')",
                 "mysql": "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d')",
+            },
+        )
+
+        self.validate_identity("ALTER TABLE visits DROP PARTITION 201901")
+        self.validate_identity("ALTER TABLE visits DROP PARTITION ALL")
+        self.validate_identity(
+            "ALTER TABLE visits DROP PARTITION tuple(toYYYYMM(toDate('2019-01-25')))"
+        )
+        self.validate_identity("ALTER TABLE visits DROP PARTITION ID '201901'")
+
+        self.validate_identity("ALTER TABLE visits REPLACE PARTITION 201901 FROM visits_tmp")
+        self.validate_identity("ALTER TABLE visits REPLACE PARTITION ALL FROM visits_tmp")
+        self.validate_identity(
+            "ALTER TABLE visits REPLACE PARTITION tuple(toYYYYMM(toDate('2019-01-25'))) FROM visits_tmp"
+        )
+        self.validate_identity("ALTER TABLE visits REPLACE PARTITION ID '201901' FROM visits_tmp")
+        self.validate_identity("ALTER TABLE visits ON CLUSTER test_cluster DROP COLUMN col1")
+        self.validate_identity("ALTER TABLE visits ON CLUSTER '{cluster}' DROP COLUMN col1")
+        self.validate_identity("DELETE FROM tbl ON CLUSTER test_cluster WHERE date = '2019-01-01'")
+        self.validate_identity("DELETE FROM tbl ON CLUSTER '{cluster}' WHERE date = '2019-01-01'")
+
+        self.assertIsInstance(
+            parse_one("Tuple(select Int64)", into=exp.DataType, read="clickhouse"), exp.DataType
+        )
+
+        self.validate_identity(
+            "INSERT INTO t (col1, col2) VALUES ('abcd', 1234)",
+            "INSERT INTO t (col1, col2) VALUES (('abcd'), (1234))",
+        )
+        self.validate_all(
+            "INSERT INTO t (col1, col2) VALUES ('abcd', 1234)",
+            write={
+                "clickhouse": "INSERT INTO t (col1, col2) VALUES (('abcd'), (1234))",
+                "postgres": "INSERT INTO t (col1, col2) VALUES (('abcd'), (1234))",
+            },
+        )
+        self.validate_identity("SELECT TRIM(TRAILING ')' FROM '(   Hello, world!   )')")
+        self.validate_identity("SELECT TRIM(LEADING '(' FROM '(   Hello, world!   )')")
+        self.validate_identity("current_timestamp").assert_is(exp.Column)
+
+        self.validate_identity("SELECT * APPLY(sum) FROM columns_transformers")
+        self.validate_identity("SELECT COLUMNS('[jk]') APPLY(toString) FROM columns_transformers")
+        self.validate_identity(
+            "SELECT COLUMNS('[jk]') APPLY(toString) APPLY(length) APPLY(max) FROM columns_transformers"
+        )
+        self.validate_identity("SELECT * APPLY(sum), COLUMNS('col') APPLY(sum) APPLY(avg) FROM t")
+        self.validate_identity(
+            "SELECT * FROM ABC WHERE hasAny(COLUMNS('.*field') APPLY(toUInt64) APPLY(to), (SELECT groupUniqArray(toUInt64(field))))"
+        )
+        self.validate_identity("SELECT col apply", "SELECT col AS apply")
+        self.validate_identity(
+            "SELECT name FROM data WHERE (SELECT DISTINCT name FROM data) IS NOT NULL",
+            "SELECT name FROM data WHERE NOT ((SELECT DISTINCT name FROM data) IS NULL)",
+        )
+
+        self.validate_identity("SELECT 1_2_3_4_5")
+        self.validate_identity("SELECT 1_b", "SELECT 1_b")
+        self.validate_identity(
+            "SELECT COUNT(1) FROM table SETTINGS additional_table_filters = {'a': 'b', 'c': 'd'}"
+        )
+        self.validate_identity("SELECT arrayConcat([1, 2], [3, 4])")
+
+        self.validate_identity("SELECT parseDateTime('2021-01-04+23:00:00', '%Y-%m-%d+%H:%i:%s')")
+        self.validate_identity(
+            "SELECT parseDateTime('2021-01-04+23:00:00', '%Y-%m-%d+%H:%i:%s', 'Asia/Istanbul')"
+        )
+
+        self.validate_identity("farmFingerprint64(x1, x2, x3)")
+
+        self.validate_identity("cosineDistance(x, y)")
+        self.validate_identity("L2Distance(x, y)")
+        self.validate_identity("tuple(1 = 1, 'foo' = 'foo')")
+
+        self.validate_identity("SELECT LIKE(a, b)", "SELECT a LIKE b")
+        self.validate_identity("SELECT notLike(a, b)", "SELECT NOT a LIKE b")
+        self.validate_identity("SELECT ilike(a, b)", "SELECT a ILIKE b")
+
+        self.validate_identity("currentDatabase()", "CURRENT_DATABASE()")
+        self.validate_identity("currentSchemas(TRUE)", "CURRENT_SCHEMAS(TRUE)")
+
+        self.validate_identity(
+            "SELECT quantilesExactExclusive(0.25, 0.5, 0.75)(x) AS y FROM (SELECT number AS x FROM num)"
+        )
+
+        self.validate_identity("SELECT or(0, 1, -2)", "SELECT 0 OR 1 OR -2")
+        self.validate_identity("SELECT and(1, 2, 3)", "SELECT 1 AND 2 AND 3")
+        self.validate_identity("SELECT or(and(3, 0), 5)", "SELECT (3 AND 0) OR 5")
+
+    def test_clickhouse_values(self):
+        ast = self.parse_one("SELECT * FROM VALUES (1, 2, 3)")
+        self.assertEqual(len(list(ast.find_all(exp.Tuple))), 4)
+
+        values = exp.select("*").from_(
+            exp.values([exp.tuple_(1, 2, 3)], alias="subq", columns=["a", "b", "c"])
+        )
+        self.assertEqual(
+            values.sql("clickhouse"),
+            "SELECT * FROM (SELECT 1 AS a, 2 AS b, 3 AS c) AS subq",
+        )
+
+        self.validate_identity("SELECT * FROM VALUES ((1, 1), (2, 1), (3, 1), (4, 1))")
+        self.validate_identity(
+            "SELECT type, id FROM VALUES ('id Int, type Int', (1, 1), (2, 1), (3, 1), (4, 1))"
+        )
+
+        self.validate_identity(
+            "INSERT INTO t (col1, col2) VALUES ('abcd', 1234)",
+            "INSERT INTO t (col1, col2) VALUES (('abcd'), (1234))",
+        )
+        self.validate_identity(
+            "INSERT INTO t (col1, col2) FORMAT Values('abcd', 1234)",
+            "INSERT INTO t (col1, col2) VALUES (('abcd'), (1234))",
+        )
+
+        self.validate_all(
+            "SELECT col FROM (SELECT 1 AS col) AS _t",
+            read={
+                "duckdb": "SELECT col FROM (VALUES (1)) AS _t(col)",
+            },
+        )
+        self.validate_all(
+            "SELECT col1, col2 FROM (SELECT 1 AS col1, 2 AS col2 UNION ALL SELECT 3, 4) AS _t",
+            read={
+                "duckdb": "SELECT col1, col2 FROM (VALUES (1, 2), (3, 4)) AS _t(col1, col2)",
             },
         )
 
@@ -433,8 +727,8 @@ class TestClickhouse(Validator):
         self.validate_identity("WITH test1 AS (SELECT i + 1, j + 1 FROM test1) SELECT * FROM test1")
 
         query = parse_one("""WITH (SELECT 1) AS y SELECT * FROM y""", read="clickhouse")
-        self.assertIsInstance(query.args["with"].expressions[0].this, exp.Subquery)
-        self.assertEqual(query.args["with"].expressions[0].alias, "y")
+        self.assertIsInstance(query.args["with_"].expressions[0].this, exp.Subquery)
+        self.assertEqual(query.args["with_"].expressions[0].alias, "y")
 
         query = "WITH 1 AS var SELECT var"
         for error_level in [ErrorLevel.IGNORE, ErrorLevel.RAISE, ErrorLevel.IMMEDIATE]:
@@ -442,6 +736,8 @@ class TestClickhouse(Validator):
                 self.parse_one(query, error_level=error_level).sql(dialect=self.dialect),
                 query,
             )
+
+        self.validate_identity("arraySlice(x, 1)")
 
     def test_ternary(self):
         self.validate_all("x ? 1 : 2", write={"clickhouse": "CASE WHEN x THEN 1 ELSE 2 END"})
@@ -485,7 +781,7 @@ class TestClickhouse(Validator):
         self.validate_all(
             "SELECT {abc: UInt32}, {b: String}, {c: DateTime},{d: Map(String, Array(UInt8))}, {e: Tuple(UInt8, String)}",
             write={
-                "clickhouse": "SELECT {abc: UInt32}, {b: String}, {c: DATETIME}, {d: Map(String, Array(UInt8))}, {e: Tuple(UInt8, String)}",
+                "clickhouse": "SELECT {abc: UInt32}, {b: String}, {c: DateTime}, {d: Map(String, Array(UInt8))}, {e: Tuple(UInt8, String)}",
                 "": "SELECT :abc, :b, :c, :d, :e",
             },
         )
@@ -515,14 +811,145 @@ class TestClickhouse(Validator):
                 write={"clickhouse": f"CAST(pow(2, 32) AS {data_type})"},
             )
 
+    def test_geom_types(self):
+        data_types = ["Point", "Ring", "LineString", "MultiLineString", "Polygon", "MultiPolygon"]
+        for data_type in data_types:
+            with self.subTest(f"Casting to ClickHouse {data_type}"):
+                self.validate_identity(f"SELECT CAST(val AS {data_type})")
+
+    def test_nothing_type(self):
+        data_types = ["Nothing", "Nullable(Nothing)"]
+        for data_type in data_types:
+            with self.subTest(f"Casting to ClickHouse {data_type}"):
+                self.validate_identity(f"SELECT CAST(val AS {data_type})")
+
+    def test_aggregate_function_column_with_any_keyword(self):
+        # Regression test for https://github.com/tobymao/sqlglot/issues/4723
+        self.validate_all(
+            """
+            CREATE TABLE my_db.my_table
+            (
+                someId UUID,
+                aggregatedColumn AggregateFunction(any, String),
+                aggregatedColumnWithParams AggregateFunction(any(somecolumn), String),
+            )
+            ENGINE = AggregatingMergeTree()
+            ORDER BY (someId)
+                    """,
+            write={
+                "clickhouse": """CREATE TABLE my_db.my_table (
+  someId UUID,
+  aggregatedColumn AggregateFunction(any, String),
+  aggregatedColumnWithParams AggregateFunction(any(somecolumn), String)
+)
+ENGINE=AggregatingMergeTree()
+ORDER BY (
+  someId
+)""",
+            },
+            pretty=True,
+        )
+
+    def test_create_table_as_alias(self):
+        ctas_alias = "CREATE TABLE my_db.my_table AS another_db.another_table"
+
+        expected = exp.Create(
+            this=exp.to_table("my_db.my_table"),
+            kind="TABLE",
+            expression=exp.to_table("another_db.another_table"),
+        )
+        self.assertEqual(self.parse_one(ctas_alias), expected)
+        self.validate_identity(ctas_alias)
+
     def test_ddl(self):
+        db_table_expr = exp.Table(this=None, db=exp.to_identifier("foo"), catalog=None)
+        create_with_cluster = exp.Create(
+            this=db_table_expr,
+            kind="DATABASE",
+            properties=exp.Properties(expressions=[exp.OnCluster(this=exp.to_identifier("c"))]),
+        )
+        self.assertEqual(create_with_cluster.sql("clickhouse"), "CREATE DATABASE foo ON CLUSTER c")
+
+        # Transpiled CREATE SCHEMA may have OnCluster property set
+        create_with_cluster = exp.Create(
+            this=db_table_expr,
+            kind="SCHEMA",
+            properties=exp.Properties(expressions=[exp.OnCluster(this=exp.to_identifier("c"))]),
+        )
+        self.assertEqual(create_with_cluster.sql("clickhouse"), "CREATE DATABASE foo ON CLUSTER c")
+
+        ctas_with_comment = exp.Create(
+            this=exp.table_("foo"),
+            kind="TABLE",
+            expression=exp.select("*").from_("db.other_table"),
+            properties=exp.Properties(
+                expressions=[
+                    exp.EngineProperty(this=exp.var("Memory")),
+                    exp.SchemaCommentProperty(this=exp.Literal.string("foo")),
+                ],
+            ),
+        )
+        self.assertEqual(
+            ctas_with_comment.sql("clickhouse"),
+            "CREATE TABLE foo ENGINE=Memory AS (SELECT * FROM db.other_table) COMMENT 'foo'",
+        )
+
+        self.validate_identity("CREATE FUNCTION linear_equation AS (x, k, b) -> k * x + b")
+        self.validate_identity("CREATE MATERIALIZED VIEW a.b TO a.c (c Int32) AS SELECT * FROM a.d")
+        self.validate_identity("""CREATE TABLE ip_data (ip4 IPv4, ip6 IPv6) ENGINE=TinyLog()""")
+        self.validate_identity("""CREATE TABLE dates (dt1 Date32) ENGINE=TinyLog()""")
+        self.validate_identity("CREATE TABLE named_tuples (a Tuple(select String, i Int64))")
+        self.validate_identity("""CREATE TABLE t (a String) EMPTY AS SELECT * FROM dummy""")
+        self.validate_identity(
+            "CREATE TABLE t1 (a String EPHEMERAL, b String EPHEMERAL func(), c String MATERIALIZED func(), d String ALIAS func()) ENGINE=TinyLog()"
+        )
+        self.validate_identity(
+            "CREATE TABLE t (a String, b String, c UInt64, PROJECTION p1 (SELECT a, sum(c) GROUP BY a, b), PROJECTION p2 (SELECT b, sum(c) GROUP BY b)) ENGINE=MergeTree()"
+        )
+        self.validate_identity(
+            """CREATE TABLE xyz (ts DateTime, data String) ENGINE=MergeTree() ORDER BY ts SETTINGS index_granularity = 8192 COMMENT '{"key": "value"}'"""
+        )
+        self.validate_identity(
+            "INSERT INTO FUNCTION s3('a', 'b', 'c', 'd', 'e') PARTITION BY CONCAT(s1, s2, s3, s4) SETTINGS set1 = 1, set2 = '2' SELECT * FROM some_table SETTINGS foo = 3"
+        )
         self.validate_identity(
             'CREATE TABLE data5 ("x" UInt32, "y" UInt32) ENGINE=MergeTree ORDER BY (round(y / 1000000000), cityHash64(x)) SAMPLE BY cityHash64(x)'
         )
         self.validate_identity(
             "CREATE TABLE foo (x UInt32) TTL time_column + INTERVAL '1' MONTH DELETE WHERE column = 'value'"
         )
+        self.validate_identity(
+            "CREATE FUNCTION parity_str AS (n) -> IF(n % 2, 'odd', 'even')",
+            "CREATE FUNCTION parity_str AS n -> CASE WHEN n % 2 THEN 'odd' ELSE 'even' END",
+        )
+        self.validate_identity(
+            "CREATE TABLE a ENGINE=Memory AS SELECT 1 AS c COMMENT 'foo'",
+            "CREATE TABLE a ENGINE=Memory AS (SELECT 1 AS c) COMMENT 'foo'",
+        )
+        self.validate_identity(
+            'CREATE TABLE t1 ("x" UInt32, "y" Dynamic, "z" Dynamic(max_types = 10)) ENGINE=MergeTree ORDER BY x'
+        )
 
+        self.validate_all(
+            "CREATE DATABASE x",
+            read={
+                "duckdb": "CREATE SCHEMA x",
+            },
+            write={
+                "clickhouse": "CREATE DATABASE x",
+                "duckdb": "CREATE SCHEMA x",
+            },
+        )
+        self.validate_all(
+            "DROP DATABASE x",
+            read={
+                "duckdb": "DROP SCHEMA x",
+            },
+            write={
+                "clickhouse": "DROP DATABASE x",
+                "duckdb": "DROP SCHEMA x",
+            },
+        )
         self.validate_all(
             """
             CREATE TABLE example1 (
@@ -536,7 +963,7 @@ class TestClickhouse(Validator):
             """,
             write={
                 "clickhouse": """CREATE TABLE example1 (
-  timestamp DATETIME,
+  timestamp DateTime,
   x UInt32 TTL now() + INTERVAL '1' MONTH,
   y String TTL timestamp + INTERVAL '1' DAY,
   z String
@@ -565,12 +992,12 @@ ORDER BY tuple()""",
   sum_hits UInt64
 )
 ENGINE=MergeTree
-PRIMARY KEY (id, toStartOfDay(timestamp), timestamp)
+PRIMARY KEY (id, dateTrunc('DAY', timestamp), timestamp)
 TTL
   timestamp + INTERVAL '1' DAY
 GROUP BY
   id,
-  toStartOfDay(timestamp)
+  dateTrunc('DAY', timestamp)
 SET
   max_hits = max(max_hits),
   sum_hits = sum(sum_hits)""",
@@ -614,7 +1041,7 @@ SETTINGS
             """,
             write={
                 "clickhouse": """CREATE TABLE example_table (
-  d DATETIME,
+  d DateTime,
   a Int32
 )
 ENGINE=MergeTree
@@ -641,7 +1068,7 @@ TTL
             """,
             write={
                 "clickhouse": """CREATE TABLE table_with_where (
-  d DATETIME,
+  d DateTime,
   a Int32
 )
 ENGINE=MergeTree
@@ -669,7 +1096,7 @@ WHERE
             """,
             write={
                 "clickhouse": """CREATE TABLE table_for_recompression (
-  d DATETIME,
+  d DateTime,
   key UInt64,
   value String
 )
@@ -701,7 +1128,7 @@ SETTINGS
             """,
             write={
                 "clickhouse": """CREATE TABLE table_for_aggregation (
-  d DATETIME,
+  d DateTime,
   k1 Int32,
   k2 Int32,
   x Int32,
@@ -808,26 +1235,58 @@ LIFETIME(MIN 0 MAX 0)""",
             },
             pretty=True,
         )
-        self.validate_identity("""CREATE TABLE ip_data (ip4 IPv4, ip6 IPv6) ENGINE=TinyLog()""")
-        self.validate_identity("""CREATE TABLE dates (dt1 Date32) ENGINE=TinyLog()""")
         self.validate_all(
             """
             CREATE TABLE t (
                 a AggregateFunction(quantiles(0.5, 0.9), UInt64),
                 b AggregateFunction(quantiles, UInt64),
-                c SimpleAggregateFunction(sum, Float64)
+                c SimpleAggregateFunction(sum, Float64),
+                d AggregateFunction(count)
             )""",
             write={
                 "clickhouse": """CREATE TABLE t (
   a AggregateFunction(quantiles(0.5, 0.9), UInt64),
   b AggregateFunction(quantiles, UInt64),
-  c SimpleAggregateFunction(sum, Float64)
+  c SimpleAggregateFunction(sum, Float64),
+  d AggregateFunction(count)
 )"""
             },
             pretty=True,
         )
-        self.validate_identity(
-            "CREATE TABLE t1 (a String EPHEMERAL, b String EPHEMERAL func(), c String MATERIALIZED func(), d String ALIAS func()) ENGINE=TinyLog()"
+
+        self.assertIsNotNone(
+            self.validate_identity("CREATE TABLE t1 (a String MATERIALIZED func())").find(
+                exp.ColumnConstraint
+            )
+        )
+
+        self.validate_all(
+            """
+            CREATE TABLE session_log
+            (
+                UserID UInt64,
+                SessionID UUID
+            )
+            ENGINE = MergeTree
+            PARTITION BY sipHash64(UserID) % 16
+            ORDER BY tuple();
+            """,
+            pretty=True,
+        )
+
+        self.validate_all(
+            """
+            CREATE TABLE visits
+            (
+                VisitDate Date,
+                Hour UInt8,
+                ClientID UUID
+            )
+            ENGINE = MergeTree()
+            PARTITION BY (toYYYYMM(VisitDate), Hour)
+            ORDER BY Hour;
+            """,
+            pretty=True,
         )
 
     def test_agg_functions(self):
@@ -856,3 +1315,272 @@ LIFETIME(MIN 0 MAX 0)""",
         )
 
         parse_one("foobar(x)").assert_is(exp.Anonymous)
+
+        self.validate_identity("SELECT approx_top_sum(column, weight) FROM t").selects[0].assert_is(
+            exp.AnonymousAggFunc
+        )
+        self.validate_identity("SELECT approx_top_sum(N)(column, weight) FROM t").selects[
+            0
+        ].assert_is(exp.ParameterizedAgg)
+        self.validate_identity("SELECT approx_top_sum(N, reserved)(column, weight) FROM t").selects[
+            0
+        ].assert_is(exp.ParameterizedAgg)
+
+    def test_drop_on_cluster(self):
+        for creatable in ("DATABASE", "TABLE", "VIEW", "DICTIONARY", "FUNCTION"):
+            with self.subTest(f"Test DROP {creatable} ON CLUSTER"):
+                self.validate_identity(f"DROP {creatable} test ON CLUSTER test_cluster")
+                self.validate_identity(f"DROP {creatable} test ON CLUSTER '{{cluster}}'")
+
+    def test_datetime_funcs(self):
+        # Each datetime func has an alias that is roundtripped to the original name e.g. (DATE_SUB, DATESUB) -> DATE_SUB
+        datetime_funcs = (("DATE_SUB", "DATESUB"), ("DATE_ADD", "DATEADD"))
+
+        # 2-arg functions of type <func>(date, unit)
+        for func in (*datetime_funcs, ("TIMESTAMP_ADD", "TIMESTAMPADD")):
+            func_name = func[0]
+            for func_alias in func:
+                self.validate_identity(
+                    f"""SELECT {func_alias}(date, INTERVAL '3' YEAR)""",
+                    f"""SELECT {func_name}(date, INTERVAL '3' YEAR)""",
+                )
+
+        # 3-arg functions of type <func>(unit, value, date)
+        for func in (*datetime_funcs, ("DATE_DIFF", "DATEDIFF"), ("TIMESTAMP_SUB", "TIMESTAMPSUB")):
+            func_name = func[0]
+            for func_alias in func:
+                with self.subTest(f"Test 3-arg date-time function {func_alias}"):
+                    self.validate_identity(
+                        f"SELECT {func_alias}(SECOND, 1, bar)",
+                        f"SELECT {func_name}(SECOND, 1, bar)",
+                    )
+        # 4-arg functions of type <func>(unit, value, date, timezone)
+        for func in (("DATE_DIFF", "DATEDIFF"),):
+            func_name = func[0]
+            for func_alias in func:
+                with self.subTest(f"Test 4-arg date-time function {func_alias}"):
+                    self.validate_identity(
+                        f"SELECT {func_alias}(SECOND, 1, bar, 'UTC')",
+                        f"SELECT {func_name}(SECOND, 1, bar, 'UTC')",
+                    )
+
+    def test_convert(self):
+        self.assertEqual(
+            convert(date(2020, 1, 1)).sql(dialect=self.dialect), "toDate('2020-01-01')"
+        )
+
+        # no fractional seconds
+        self.assertEqual(
+            convert(datetime(2020, 1, 1, 0, 0, 1)).sql(dialect=self.dialect),
+            "CAST('2020-01-01 00:00:01' AS DateTime64(6))",
+        )
+        self.assertEqual(
+            convert(datetime(2020, 1, 1, 0, 0, 1, tzinfo=timezone.utc)).sql(dialect=self.dialect),
+            "CAST('2020-01-01 00:00:01' AS DateTime64(6, 'UTC'))",
+        )
+
+        # with fractional seconds
+        self.assertEqual(
+            convert(datetime(2020, 1, 1, 0, 0, 1, 1)).sql(dialect=self.dialect),
+            "CAST('2020-01-01 00:00:01.000001' AS DateTime64(6))",
+        )
+        self.assertEqual(
+            convert(datetime(2020, 1, 1, 0, 0, 1, 1, tzinfo=timezone.utc)).sql(
+                dialect=self.dialect
+            ),
+            "CAST('2020-01-01 00:00:01.000001' AS DateTime64(6, 'UTC'))",
+        )
+
+    def test_timestr_to_time(self):
+        # no fractional seconds
+        time_strings = [
+            "2020-01-01 00:00:01",
+            "2020-01-01 00:00:01+01:00",
+            " 2020-01-01 00:00:01-01:00 ",
+            "2020-01-01T00:00:01+01:00",
+        ]
+        for time_string in time_strings:
+            with self.subTest(f"'{time_string}'"):
+                self.assertEqual(
+                    exp.TimeStrToTime(this=exp.Literal.string(time_string)).sql(
+                        dialect=self.dialect
+                    ),
+                    f"CAST('{time_string}' AS DateTime64(6))",
+                )
+
+        time_strings_no_utc = ["2020-01-01 00:00:01" for i in range(4)]
+        for utc, no_utc in zip(time_strings, time_strings_no_utc):
+            with self.subTest(f"'{time_string}' with UTC timezone"):
+                self.assertEqual(
+                    exp.TimeStrToTime(
+                        this=exp.Literal.string(utc), zone=exp.Literal.string("UTC")
+                    ).sql(dialect=self.dialect),
+                    f"CAST('{no_utc}' AS DateTime64(6, 'UTC'))",
+                )
+
+        # with fractional seconds
+        time_strings = [
+            "2020-01-01 00:00:01.001",
+            "2020-01-01 00:00:01.000001",
+            "2020-01-01 00:00:01.001+00:00",
+            "2020-01-01 00:00:01.000001-00:00",
+            "2020-01-01 00:00:01.0001",
+            "2020-01-01 00:00:01.1+00:00",
+        ]
+
+        for time_string in time_strings:
+            with self.subTest(f"'{time_string}'"):
+                self.assertEqual(
+                    exp.TimeStrToTime(this=exp.Literal.string(time_string[0])).sql(
+                        dialect=self.dialect
+                    ),
+                    f"CAST('{time_string[0]}' AS DateTime64(6))",
+                )
+
+        time_strings_no_utc = [
+            "2020-01-01 00:00:01.001000",
+            "2020-01-01 00:00:01.000001",
+            "2020-01-01 00:00:01.001000",
+            "2020-01-01 00:00:01.000001",
+            "2020-01-01 00:00:01.000100",
+            "2020-01-01 00:00:01.100000",
+        ]
+
+        for utc, no_utc in zip(time_strings, time_strings_no_utc):
+            with self.subTest(f"'{time_string}' with UTC timezone"):
+                self.assertEqual(
+                    exp.TimeStrToTime(
+                        this=exp.Literal.string(utc), zone=exp.Literal.string("UTC")
+                    ).sql(dialect=self.dialect),
+                    f"CAST('{no_utc}' AS DateTime64(6, 'UTC'))",
+                )
+
+    def test_grant(self):
+        self.validate_identity("GRANT SELECT(x, y) ON db.table TO john WITH GRANT OPTION")
+        self.validate_identity("GRANT INSERT(x, y) ON db.table TO john")
+
+    def test_revoke(self):
+        self.validate_identity("REVOKE SELECT(x, y) ON db.table FROM john")
+        self.validate_identity("REVOKE INSERT(x, y) ON db.table FROM john")
+
+    def test_array_join(self):
+        expr = self.validate_identity(
+            "SELECT * FROM arrays_test ARRAY JOIN arr1, arrays_test.arr2 AS foo, ['a', 'b', 'c'] AS elem"
+        )
+        joins = expr.args["joins"]
+        self.assertEqual(len(joins), 1)
+
+        join = joins[0]
+        self.assertEqual(join.kind, "ARRAY")
+        self.assertIsInstance(join.this, exp.Column)
+
+        self.assertEqual(len(join.expressions), 2)
+        self.assertIsInstance(join.expressions[0], exp.Alias)
+        self.assertIsInstance(join.expressions[0].this, exp.Column)
+
+        self.assertIsInstance(join.expressions[1], exp.Alias)
+        self.assertIsInstance(join.expressions[1].this, exp.Array)
+
+        self.validate_identity("SELECT s, arr FROM arrays_test ARRAY JOIN arr")
+        self.validate_identity("SELECT s, arr, a FROM arrays_test LEFT ARRAY JOIN arr AS a")
+        self.validate_identity(
+            "SELECT s, arr_external FROM arrays_test ARRAY JOIN [1, 2, 3] AS arr_external"
+        )
+        self.validate_identity(
+            "SELECT * FROM arrays_test ARRAY JOIN [1, 2, 3] AS arr_external1, ['a', 'b', 'c'] AS arr_external2, splitByString(',', 'asd,qwerty,zxc') AS arr_external3"
+        )
+
+    def test_traverse_scope(self):
+        sql = "SELECT * FROM t FINAL"
+        scopes = traverse_scope(parse_one(sql, dialect=self.dialect))
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(set(scopes[0].sources), {"t"})
+
+    def test_window_functions(self):
+        self.validate_identity(
+            "SELECT row_number(column1) OVER (PARTITION BY column2 ORDER BY column3) FROM table"
+        )
+        self.validate_identity(
+            "SELECT row_number() OVER (PARTITION BY column2 ORDER BY column3) FROM table"
+        )
+
+    def test_functions(self):
+        self.validate_identity("SELECT TRANSFORM(foo, [1, 2], ['first', 'second']) FROM table")
+        self.validate_identity(
+            "SELECT TRANSFORM(foo, [1, 2], ['first', 'second'], 'default') FROM table"
+        )
+
+    def test_array_offset(self):
+        with self.assertLogs(helper_logger) as cm:
+            self.validate_all(
+                "SELECT col[1]",
+                write={
+                    "bigquery": "SELECT col[0]",
+                    "duckdb": "SELECT col[1]",
+                    "hive": "SELECT col[0]",
+                    "clickhouse": "SELECT col[1]",
+                    "presto": "SELECT col[1]",
+                },
+            )
+
+            self.assertEqual(
+                cm.output,
+                [
+                    "INFO:sqlglot:Applying array index offset (-1)",
+                    "INFO:sqlglot:Applying array index offset (1)",
+                    "INFO:sqlglot:Applying array index offset (1)",
+                    "INFO:sqlglot:Applying array index offset (1)",
+                ],
+            )
+
+    def test_to_start_of(self):
+        for unit in ("SECOND", "DAY", "YEAR"):
+            self.validate_all(
+                f"toStartOf{unit}(x)",
+                write={
+                    "databricks": f"DATE_TRUNC('{unit}', x)",
+                    "duckdb": f"DATE_TRUNC('{unit}', x)",
+                    "doris": f"DATE_TRUNC(x, '{unit}')",
+                    "presto": f"DATE_TRUNC('{unit}', x)",
+                    "spark": f"DATE_TRUNC('{unit}', x)",
+                },
+            )
+
+        self.validate_all(
+            "toMonday(x)",
+            write={
+                "databricks": "DATE_TRUNC('WEEK', x)",
+                "duckdb": "DATE_TRUNC('WEEK', x)",
+                "doris": "DATE_TRUNC(x, 'WEEK')",
+                "presto": "DATE_TRUNC('WEEK', x)",
+                "spark": "DATE_TRUNC('WEEK', x)",
+            },
+        )
+
+    def test_string_split(self):
+        self.validate_all(
+            "splitByString('s', x)",
+            read={
+                "bigquery": "SPLIT(x, 's')",
+                "duckdb": "STRING_SPLIT(x, 's')",
+            },
+            write={
+                "clickhouse": "splitByString('s', x)",
+                "doris": "SPLIT_BY_STRING(x, 's')",
+                "duckdb": "STR_SPLIT(x, 's')",
+                "hive": r"SPLIT(x, CONCAT('\\Q', 's', '\\E'))",
+            },
+        )
+        self.validate_all(
+            r"splitByRegexp('\\d+', x)",
+            read={
+                "duckdb": r"STRING_SPLIT_REGEX(x, '\d+')",
+                "hive": r"SPLIT(x, '\\d+')",
+            },
+            write={
+                "clickhouse": r"splitByRegexp('\\d+', x)",
+                "duckdb": r"STR_SPLIT_REGEX(x, '\d+')",
+                "hive": r"SPLIT(x, '\\d+')",
+            },
+        )
+        self.validate_identity("splitByChar('', x)")

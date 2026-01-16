@@ -75,8 +75,8 @@ def null_if_any(*required):
     return decorator
 
 
-@null_if_any("substr", "this")
-def str_position(substr, this, position=None):
+@null_if_any("this", "substr")
+def str_position(this, substr, position=None):
     position = position - 1 if position is not None else position
     return this.find(substr, position) + 1
 
@@ -240,5 +240,7 @@ ENV = {
         for x in range(0, len(args), 2)
         if (args[x + 1] is not None and args[x] is not None)
     },
-    "UNIXTOTIME": null_if_any(lambda arg: datetime.datetime.utcfromtimestamp(arg)),
+    "UNIXTOTIME": null_if_any(
+        lambda arg: datetime.datetime.fromtimestamp(arg, datetime.timezone.utc)
+    ),
 }

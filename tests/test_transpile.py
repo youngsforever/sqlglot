@@ -23,6 +23,11 @@ class TestTranspile(unittest.TestCase):
 
     def test_weird_chars(self):
         self.assertEqual(transpile("0Êß")[0], "0 AS Êß")
+        self.assertEqual(
+            # Ideographic space after SELECT (\u3000)
+            transpile("SELECT　* FROM t WHERE c = 1")[0],
+            "SELECT * FROM t WHERE c = 1",
+        )
 
     def test_alias(self):
         self.assertEqual(transpile("SELECT SUM(y) KEEP")[0], "SELECT SUM(y) AS KEEP")
@@ -41,7 +46,7 @@ class TestTranspile(unittest.TestCase):
             "SELECT 1 FROM a.b.table1 AS t UNPIVOT((c3) FOR c4 IN (a, b))",
         )
 
-        for key in ("union", "over", "from", "join"):
+        for key in ("union", "from", "join"):
             with self.subTest(f"alias {key}"):
                 self.validate(f"SELECT x AS {key}", f"SELECT x AS {key}")
                 self.validate(f'SELECT x "{key}"', f'SELECT x AS "{key}"')
@@ -111,6 +116,10 @@ class TestTranspile(unittest.TestCase):
         self.validate("SELECT a\r\nFROM b", "SELECT a FROM b")
 
     def test_comments(self):
+        self.validate(
+            "select /* asfd /* asdf */ asdf */ 1",
+            "/* asfd /* asdf */ asdf */ SELECT 1",
+        )
         self.validate(
             "SELECT c /* foo */ AS alias",
             "SELECT c AS alias /* foo */",
@@ -551,6 +560,46 @@ FROM x""",
             pretty=True,
         )
 
+        self.validate(
+            """SELECT X FROM  catalog.db.table WHERE Y
+        --
+        AND Z""",
+            """SELECT X FROM catalog.db.table WHERE Y AND Z""",
+        )
+        self.validate(
+            """with a as /* comment */ ( select * from b) select * from a""",
+            """WITH a /* comment */ AS (SELECT * FROM b) SELECT * FROM a""",
+        )
+        self.validate(
+            """
+  -- comment at the top
+WITH
+-- comment for tbl1
+tbl1 AS (SELECT 1)
+-- comment for tbl2
+, tbl2 AS (SELECT 2)
+-- comment for tbl3
+, tbl3 AS (SELECT 3)
+-- comment for final select
+SELECT * FROM tbl1""",
+            """/* comment at the top */
+WITH tbl1 /* comment for tbl1 */ AS (
+  SELECT
+    1
+), tbl2 /* comment for tbl2 */ AS (
+  SELECT
+    2
+), tbl3 /* comment for tbl3 */ AS (
+  SELECT
+    3
+)
+/* comment for final select */
+SELECT
+  *
+FROM tbl1""",
+            pretty=True,
+        )
+
     def test_types(self):
         self.validate("INT 1", "CAST(1 AS INT)")
         self.validate("VARCHAR 'x' y", "CAST('x' AS VARCHAR) AS y")
@@ -566,7 +615,7 @@ FROM x""",
         self.validate("CAST(x AS INT)::BOOLEAN", "CAST(CAST(x AS INT) AS BOOLEAN)")
 
         with self.assertRaises(ParseError):
-            transpile("x::z", read="duckdb")
+            transpile("x::z", read="clickhouse")
 
     def test_not_range(self):
         self.validate("a NOT LIKE b", "NOT a LIKE b")
@@ -578,24 +627,24 @@ FROM x""",
     def test_extract(self):
         self.validate(
             "EXTRACT(day FROM '2020-01-01'::TIMESTAMP)",
-            "EXTRACT(day FROM CAST('2020-01-01' AS TIMESTAMP))",
+            "EXTRACT(DAY FROM CAST('2020-01-01' AS TIMESTAMP))",
         )
         self.validate(
             "EXTRACT(timezone FROM '2020-01-01'::TIMESTAMP)",
-            "EXTRACT(timezone FROM CAST('2020-01-01' AS TIMESTAMP))",
+            "EXTRACT(TIMEZONE FROM CAST('2020-01-01' AS TIMESTAMP))",
         )
         self.validate(
             "EXTRACT(year FROM '2020-01-01'::TIMESTAMP WITH TIME ZONE)",
-            "EXTRACT(year FROM CAST('2020-01-01' AS TIMESTAMPTZ))",
+            "EXTRACT(YEAR FROM CAST('2020-01-01' AS TIMESTAMPTZ))",
         )
         self.validate(
             "extract(month from '2021-01-31'::timestamp without time zone)",
-            "EXTRACT(month FROM CAST('2021-01-31' AS TIMESTAMP))",
+            "EXTRACT(MONTH FROM CAST('2021-01-31' AS TIMESTAMP))",
         )
-        self.validate("extract(week from current_date + 2)", "EXTRACT(week FROM CURRENT_DATE + 2)")
+        self.validate("extract(week from current_date + 2)", "EXTRACT(WEEK FROM CURRENT_DATE + 2)")
         self.validate(
             "EXTRACT(minute FROM datetime1 - datetime2)",
-            "EXTRACT(minute FROM datetime1 - datetime2)",
+            "EXTRACT(MINUTE FROM datetime1 - datetime2)",
         )
 
     def test_if(self):
@@ -624,7 +673,7 @@ FROM x""",
         )
         self.validate(
             "WITH A(filter) AS (VALUES 1, 2, 3) SELECT * FROM A WHERE filter >= 2",
-            "WITH A(filter) AS (VALUES (1), (2), (3)) SELECT * FROM A WHERE filter >= 2",
+            "WITH A(filter) AS (SELECT * FROM (VALUES (1), (2), (3)) AS _values) SELECT * FROM A WHERE filter >= 2",
             read="presto",
         )
         self.validate(
@@ -718,6 +767,11 @@ FROM x""",
         self.validate("TIME_TO_STR(x, 'y')", "DATE_FORMAT(x, 'y')", write="hive")
 
         self.validate("TIME_STR_TO_TIME(x)", "TIME_STR_TO_TIME(x)", write=None)
+        self.validate(
+            "TIME_STR_TO_TIME(x, 'America/Los_Angeles')",
+            "TIME_STR_TO_TIME(x, 'America/Los_Angeles')",
+            write=None,
+        )
         self.validate("TIME_STR_TO_UNIX(x)", "TIME_STR_TO_UNIX(x)", write=None)
         self.validate("TIME_TO_TIME_STR(x)", "CAST(x AS TEXT)", write=None)
         self.validate("TIME_TO_STR(x, 'y')", "TIME_TO_STR(x, 'y')", write=None)
@@ -749,7 +803,7 @@ FROM x""",
         self.validate("STR_TO_TIME('x', 'y')", "DATE_PARSE('x', 'y')", write="presto")
         self.validate(
             "STR_TO_UNIX('x', 'y')",
-            "TO_UNIXTIME(COALESCE(TRY(DATE_PARSE(CAST('x' AS VARCHAR), 'y')), PARSE_DATETIME(CAST('x' AS VARCHAR), 'y')))",
+            "TO_UNIXTIME(COALESCE(TRY(DATE_PARSE(CAST('x' AS VARCHAR), 'y')), PARSE_DATETIME(DATE_FORMAT(CAST('x' AS TIMESTAMP), 'y'), 'y')))",
             write="presto",
         )
         self.validate("TIME_TO_STR(x, 'y')", "DATE_FORMAT(x, 'y')", write="presto")
@@ -800,10 +854,10 @@ FROM x""",
             self.assertEqual(
                 cm.output,
                 [
-                    "WARNING:sqlglot:Applying array index offset (1)",
-                    "WARNING:sqlglot:Applying array index offset (-1)",
-                    "WARNING:sqlglot:Applying array index offset (1)",
-                    "WARNING:sqlglot:Applying array index offset (1)",
+                    "INFO:sqlglot:Applying array index offset (1)",
+                    "INFO:sqlglot:Applying array index offset (-1)",
+                    "INFO:sqlglot:Applying array index offset (1)",
+                    "INFO:sqlglot:Applying array index offset (1)",
                 ],
             )
 
@@ -823,22 +877,18 @@ FROM x""",
             "ALTER ROLE CURRENT_USER WITH REPLICATION",
             "ALTER RULE foo ON bla RENAME TO baz",
             "ALTER SEQUENCE IF EXISTS baz RESTART WITH boo",
-            "ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS=3",
             "ALTER TABLE integers DROP PRIMARY KEY",
             "ALTER TABLE table1 MODIFY COLUMN name1 SET TAG foo='bar'",
             "ALTER TABLE table1 RENAME COLUMN c1 AS c2",
             "ALTER TABLE table1 RENAME COLUMN c1 TO c2, c2 TO c3",
             "ALTER TABLE table1 RENAME COLUMN c1 c2",
             "ALTER TYPE electronic_mail RENAME TO email",
-            "ALTER VIEW foo ALTER COLUMN bla SET DEFAULT 'NOT SET'",
             "ALTER schema doo",
-            "ANALYZE a.y",
             "CALL catalog.system.iceberg_procedure_name(named_arg_1 => 'arg_1', named_arg_2 => 'arg_2')",
             "COMMENT ON ACCESS METHOD gin IS 'GIN index access method'",
             "CREATE OR REPLACE STAGE",
             "EXECUTE statement",
             "EXPLAIN SELECT * FROM x",
-            "GRANT INSERT ON foo TO bla",
             "LOAD foo",
             "OPTIMIZE TABLE y",
             "PREPARE statement",

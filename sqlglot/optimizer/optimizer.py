@@ -3,7 +3,6 @@ from __future__ import annotations
 import inspect
 import typing as t
 
-import sqlglot
 from sqlglot import Schema, exp
 from sqlglot.dialects.dialect import DialectType
 from sqlglot.optimizer.annotate_types import annotate_types
@@ -47,6 +46,7 @@ def optimize(
     catalog: t.Optional[str | exp.Identifier] = None,
     dialect: DialectType = None,
     rules: t.Sequence[t.Callable] = RULES,
+    sql: t.Optional[str] = None,
     **kwargs,
 ) -> exp.Expression:
     """
@@ -67,17 +67,20 @@ def optimize(
         rules: sequence of optimizer rules to use.
             Many of the rules require tables and columns to be qualified.
             Do not remove `qualify` from the sequence of rules unless you know what you're doing!
+        sql: Original SQL string for error highlighting. If not provided, errors will not include
+            highlighting. Requires that the expression has position metadata from parsing.
         **kwargs: If a rule has a keyword argument with a same name in **kwargs, it will be passed in.
 
     Returns:
         The optimized expression.
     """
-    schema = ensure_schema(schema or sqlglot.schema, dialect=dialect)
+    schema = ensure_schema(schema, dialect=dialect)
     possible_kwargs = {
         "db": db,
         "catalog": catalog,
         "schema": schema,
         "dialect": dialect,
+        "sql": sql,
         "isolate_tables": True,  # needed for other optimizations to perform well
         "quote_identifiers": False,
         **kwargs,

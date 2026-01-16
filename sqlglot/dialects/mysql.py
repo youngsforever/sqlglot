@@ -11,7 +11,7 @@ from sqlglot.dialects.dialect import (
     datestrtodate_sql,
     build_formatted_time,
     isnull_to_is_null,
-    locate_to_strposition,
+    length_or_char_length_sql,
     max_or_greatest,
     min_or_least,
     no_ilike_sql,
@@ -22,11 +22,15 @@ from sqlglot.dialects.dialect import (
     build_date_delta,
     build_date_delta_with_interval,
     rename_func,
-    strposition_to_locate_sql,
+    strposition_sql,
     unit_to_var,
+    trim_sql,
+    timestrtotime_sql,
 )
+from sqlglot.generator import unsupported_args
 from sqlglot.helper import seq_get
 from sqlglot.tokens import TokenType
+from sqlglot.typing.mysql import EXPRESSION_METADATA
 
 
 def _show_parser(*args: t.Any, **kwargs: t.Any) -> t.Callable[[MySQL.Parser], exp.Show]:
@@ -95,19 +99,18 @@ def _str_to_date_sql(
     return self.func("STR_TO_DATE", expression.this, self.format_time(expression))
 
 
-def _trim_sql(self: MySQL.Generator, expression: exp.Trim) -> str:
-    target = self.sql(expression, "this")
-    trim_type = self.sql(expression, "position")
-    remove_chars = self.sql(expression, "expression")
+def _unix_to_time_sql(self: MySQL.Generator, expression: exp.UnixToTime) -> str:
+    scale = expression.args.get("scale")
+    timestamp = expression.this
 
-    # Use TRIM/LTRIM/RTRIM syntax if the expression isn't mysql-specific
-    if not remove_chars:
-        return self.trim_sql(expression)
+    if scale in (None, exp.UnixToTime.SECONDS):
+        return self.func("FROM_UNIXTIME", timestamp, self.format_time(expression))
 
-    trim_type = f"{trim_type} " if trim_type else ""
-    remove_chars = f"{remove_chars} " if remove_chars else ""
-    from_part = "FROM " if trim_type or remove_chars else ""
-    return f"TRIM({trim_type}{remove_chars}{from_part}{target})"
+    return self.func(
+        "FROM_UNIXTIME",
+        exp.Div(this=timestamp, expression=exp.func("POW", 10, scale)),
+        self.format_time(expression),
+    )
 
 
 def date_add_sql(
@@ -144,6 +147,8 @@ def _remove_ts_or_ds_to_date(
 
 
 class MySQL(Dialect):
+    PROMOTE_TO_INFERRED_DATETIME_TYPE = True
+
     # https://dev.mysql.com/doc/refman/8.0/en/identifiers.html
     IDENTIFIERS_CAN_START_WITH_DIGIT = True
 
@@ -159,6 +164,10 @@ class MySQL(Dialect):
     SUPPORTS_USER_DEFINED_TYPES = False
     SUPPORTS_SEMI_ANTI_JOIN = False
     SAFE_DIVISION = True
+    SAFE_TO_ELIMINATE_DOUBLE_NEGATION = False
+    LEAST_GREATEST_IGNORES_NULLS = False
+
+    EXPRESSION_METADATA = EXPRESSION_METADATA.copy()
 
     # https://prestodb.io/docs/current/functions/datetime.html#mysql-date-functions
     TIME_MAPPING = {
@@ -172,7 +181,22 @@ class MySQL(Dialect):
         "%k": "%-H",
         "%l": "%-I",
         "%T": "%H:%M:%S",
-        "%W": "%a",
+        "%W": "%A",
+    }
+
+    VALID_INTERVAL_UNITS = {
+        *Dialect.VALID_INTERVAL_UNITS,
+        "SECOND_MICROSECOND",
+        "MINUTE_MICROSECOND",
+        "MINUTE_SECOND",
+        "HOUR_MICROSECOND",
+        "HOUR_SECOND",
+        "HOUR_MINUTE",
+        "DAY_MICROSECOND",
+        "DAY_SECOND",
+        "DAY_MINUTE",
+        "DAY_HOUR",
+        "YEAR_MONTH",
     }
 
     class Tokenizer(tokens.Tokenizer):
@@ -182,25 +206,37 @@ class MySQL(Dialect):
         STRING_ESCAPES = ["'", '"', "\\"]
         BIT_STRINGS = [("b'", "'"), ("B'", "'"), ("0b", "")]
         HEX_STRINGS = [("x'", "'"), ("X'", "'"), ("0x", "")]
+        # https://dev.mysql.com/doc/refman/8.4/en/string-literals.html
+        ESCAPE_FOLLOW_CHARS = ["0", "b", "n", "r", "t", "Z", "%", "_"]
+
+        NESTED_COMMENTS = False
 
         KEYWORDS = {
             **tokens.Tokenizer.KEYWORDS,
+            "BLOB": TokenType.BLOB,
             "CHARSET": TokenType.CHARACTER_SET,
+            "DISTINCTROW": TokenType.DISTINCT,
+            "EXPLAIN": TokenType.DESCRIBE,
             "FORCE": TokenType.FORCE,
             "IGNORE": TokenType.IGNORE,
+            "KEY": TokenType.KEY,
             "LOCK TABLES": TokenType.COMMAND,
             "LONGBLOB": TokenType.LONGBLOB,
             "LONGTEXT": TokenType.LONGTEXT,
             "MEDIUMBLOB": TokenType.MEDIUMBLOB,
-            "TINYBLOB": TokenType.TINYBLOB,
-            "TINYTEXT": TokenType.TINYTEXT,
-            "MEDIUMTEXT": TokenType.MEDIUMTEXT,
             "MEDIUMINT": TokenType.MEDIUMINT,
+            "MEDIUMTEXT": TokenType.MEDIUMTEXT,
             "MEMBER OF": TokenType.MEMBER_OF,
+            "MOD": TokenType.MOD,
             "SEPARATOR": TokenType.SEPARATOR,
-            "START": TokenType.BEGIN,
+            "SERIAL": TokenType.SERIAL,
             "SIGNED": TokenType.BIGINT,
             "SIGNED INTEGER": TokenType.BIGINT,
+            "SOUNDS LIKE": TokenType.SOUNDS_LIKE,
+            "START": TokenType.BEGIN,
+            "TIMESTAMP": TokenType.TIMESTAMPTZ,
+            "TINYBLOB": TokenType.TINYBLOB,
+            "TINYTEXT": TokenType.TINYTEXT,
             "UNLOCK TABLES": TokenType.COMMAND,
             "UNSIGNED": TokenType.UBIGINT,
             "UNSIGNED INTEGER": TokenType.UBIGINT,
@@ -251,20 +287,26 @@ class MySQL(Dialect):
             "@@": TokenType.SESSION_PARAMETER,
         }
 
-        COMMANDS = tokens.Tokenizer.COMMANDS - {TokenType.SHOW}
+        COMMANDS = {*tokens.Tokenizer.COMMANDS, TokenType.REPLACE} - {TokenType.SHOW}
 
     class Parser(parser.Parser):
         FUNC_TOKENS = {
             *parser.Parser.FUNC_TOKENS,
             TokenType.DATABASE,
+            TokenType.MOD,
             TokenType.SCHEMA,
             TokenType.VALUES,
+            TokenType.CHARACTER_SET,
         }
 
         CONJUNCTION = {
             **parser.Parser.CONJUNCTION,
             TokenType.DAMP: exp.And,
             TokenType.XOR: exp.Xor,
+        }
+
+        DISJUNCTION = {
+            **parser.Parser.DISJUNCTION,
             TokenType.DPIPE: exp.Or,
         }
 
@@ -274,6 +316,11 @@ class MySQL(Dialect):
 
         RANGE_PARSERS = {
             **parser.Parser.RANGE_PARSERS,
+            TokenType.SOUNDS_LIKE: lambda self, this: self.expression(
+                exp.EQ,
+                this=self.expression(exp.Soundex, this=this),
+                expression=self.expression(exp.Soundex, this=self._parse_term()),
+            ),
             TokenType.MEMBER_OF: lambda self, this: self.expression(
                 exp.JSONArrayContains,
                 this=this,
@@ -283,6 +330,14 @@ class MySQL(Dialect):
 
         FUNCTIONS = {
             **parser.Parser.FUNCTIONS,
+            "BIT_AND": exp.BitwiseAndAgg.from_arg_list,
+            "BIT_OR": exp.BitwiseOrAgg.from_arg_list,
+            "BIT_XOR": exp.BitwiseXorAgg.from_arg_list,
+            "BIT_COUNT": exp.BitwiseCount.from_arg_list,
+            "CONVERT_TZ": lambda args: exp.ConvertTimezone(
+                source_tz=seq_get(args, 1), target_tz=seq_get(args, 2), timestamp=seq_get(args, 0)
+            ),
+            "CURDATE": exp.CurrentDate.from_arg_list,
             "DATE": lambda args: exp.TsOrDsToDate(this=seq_get(args, 0)),
             "DATE_ADD": build_date_delta_with_interval(exp.DateAdd),
             "DATE_FORMAT": build_formatted_time(exp.TimeToStr, "mysql"),
@@ -291,16 +346,18 @@ class MySQL(Dialect):
             "DAYOFMONTH": lambda args: exp.DayOfMonth(this=exp.TsOrDsToDate(this=seq_get(args, 0))),
             "DAYOFWEEK": lambda args: exp.DayOfWeek(this=exp.TsOrDsToDate(this=seq_get(args, 0))),
             "DAYOFYEAR": lambda args: exp.DayOfYear(this=exp.TsOrDsToDate(this=seq_get(args, 0))),
-            "INSTR": lambda args: exp.StrPosition(substr=seq_get(args, 1), this=seq_get(args, 0)),
+            "FORMAT": exp.NumberToStr.from_arg_list,
             "FROM_UNIXTIME": build_formatted_time(exp.UnixToTime, "mysql"),
             "ISNULL": isnull_to_is_null,
-            "LOCATE": locate_to_strposition,
+            "LENGTH": lambda args: exp.Length(this=seq_get(args, 0), binary=True),
             "MAKETIME": exp.TimeFromParts.from_arg_list,
             "MONTH": lambda args: exp.Month(this=exp.TsOrDsToDate(this=seq_get(args, 0))),
             "MONTHNAME": lambda args: exp.TimeToStr(
                 this=exp.TsOrDsToDate(this=seq_get(args, 0)),
                 format=exp.Literal.string("%B"),
             ),
+            "SCHEMA": exp.CurrentSchema.from_arg_list,
+            "DATABASE": exp.CurrentSchema.from_arg_list,
             "STR_TO_DATE": _str_to_date,
             "TIMESTAMPDIFF": build_date_delta(exp.TimestampDiff),
             "TO_DAYS": lambda args: exp.paren(
@@ -320,12 +377,13 @@ class MySQL(Dialect):
 
         FUNCTION_PARSERS = {
             **parser.Parser.FUNCTION_PARSERS,
-            "CHAR": lambda self: self._parse_chr(),
             "GROUP_CONCAT": lambda self: self._parse_group_concat(),
             # https://dev.mysql.com/doc/refman/5.7/en/miscellaneous-functions.html#function_values
             "VALUES": lambda self: self.expression(
                 exp.Anonymous, this="VALUES", expressions=[self._parse_id_var()]
             ),
+            "JSON_VALUE": lambda self: self._parse_json_value(),
+            "SUBSTR": lambda self: self._parse_substring(),
         }
 
         STATEMENT_PARSERS = {
@@ -408,11 +466,17 @@ class MySQL(Dialect):
             "INDEX": lambda self: self._parse_index_constraint(),
             "KEY": lambda self: self._parse_index_constraint(),
             "SPATIAL": lambda self: self._parse_index_constraint(kind="SPATIAL"),
+            "ZEROFILL": lambda self: self.expression(exp.ZeroFillColumnConstraint),
         }
 
         ALTER_PARSERS = {
             **parser.Parser.ALTER_PARSERS,
             "MODIFY": lambda self: self._parse_alter_table_alter(),
+        }
+
+        ALTER_ALTER_PARSERS = {
+            **parser.Parser.ALTER_ALTER_PARSERS,
+            "INDEX": lambda self: self._parse_alter_table_alter_index(),
         }
 
         SCHEMA_UNNAMED_CONSTRAINTS = {
@@ -440,10 +504,42 @@ class MySQL(Dialect):
             TokenType.SET,
         }
 
+        # SELECT [ ALL | DISTINCT | DISTINCTROW ] [ <OPERATION_MODIFIERS> ]
+        OPERATION_MODIFIERS = {
+            "HIGH_PRIORITY",
+            "STRAIGHT_JOIN",
+            "SQL_SMALL_RESULT",
+            "SQL_BIG_RESULT",
+            "SQL_BUFFER_RESULT",
+            "SQL_NO_CACHE",
+            "SQL_CALC_FOUND_ROWS",
+        }
+
         LOG_DEFAULTS_TO_LN = True
         STRING_ALIASES = True
         VALUES_FOLLOWED_BY_PAREN = False
         SUPPORTS_PARTITION_SELECTION = True
+
+        def _parse_generated_as_identity(
+            self,
+        ) -> (
+            exp.GeneratedAsIdentityColumnConstraint
+            | exp.ComputedColumnConstraint
+            | exp.GeneratedAsRowColumnConstraint
+        ):
+            this = super()._parse_generated_as_identity()
+
+            if self._match_texts(("STORED", "VIRTUAL")):
+                persisted = self._prev.text.upper() == "STORED"
+
+                if isinstance(this, exp.ComputedColumnConstraint):
+                    this.set("persisted", persisted)
+                elif isinstance(this, exp.GeneratedAsIdentityColumnConstraint):
+                    this = self.expression(
+                        exp.ComputedColumnConstraint, this=this.expression, persisted=persisted
+                    )
+
+            return this
 
         def _parse_primary_key_part(self) -> t.Optional[exp.Expression]:
             this = self._parse_id_var()
@@ -509,9 +605,11 @@ class MySQL(Dialect):
             full: t.Optional[bool] = None,
             global_: t.Optional[bool] = None,
         ) -> exp.Show:
+            json = self._match_text_seq("JSON")
+
             if target:
                 if isinstance(target, str):
-                    self._match_text_seq(target)
+                    self._match_text_seq(*target.split(" "))
                 target_id = self._parse_id_var()
             else:
                 target_id = None
@@ -548,6 +646,12 @@ class MySQL(Dialect):
             mutex = True if self._match_text_seq("MUTEX") else None
             mutex = False if self._match_text_seq("STATUS") else mutex
 
+            for_table = self._parse_id_var() if self._match_text_seq("FOR", "TABLE") else None
+            for_group = self._parse_string() if self._match_text_seq("FOR", "GROUP") else None
+            for_user = self._parse_string() if self._match_text_seq("FOR", "USER") else None
+            for_role = self._parse_string() if self._match_text_seq("FOR", "ROLE") else None
+            into_outfile = self._parse_string() if self._match_text_seq("INTO", "OUTFILE") else None
+
             return self.expression(
                 exp.Show,
                 this=this,
@@ -564,7 +668,13 @@ class MySQL(Dialect):
                 offset=offset,
                 limit=limit,
                 mutex=mutex,
-                **{"global": global_},  # type: ignore
+                for_table=for_table,
+                for_group=for_group,
+                for_user=for_user,
+                for_role=for_role,
+                into_outfile=into_outfile,
+                json=json,
+                global_=global_,
             )
 
         def _parse_oldstyle_limit(
@@ -583,19 +693,21 @@ class MySQL(Dialect):
             return offset, limit
 
         def _parse_set_item_charset(self, kind: str) -> exp.Expression:
-            this = self._parse_string() or self._parse_id_var()
+            this = self._parse_string() or self._parse_unquoted_field()
             return self.expression(exp.SetItem, this=this, kind=kind)
 
         def _parse_set_item_names(self) -> exp.Expression:
-            charset = self._parse_string() or self._parse_id_var()
+            charset = self._parse_string() or self._parse_unquoted_field()
             if self._match_text_seq("COLLATE"):
-                collate = self._parse_string() or self._parse_id_var()
+                collate = self._parse_string() or self._parse_unquoted_field()
             else:
                 collate = None
 
             return self.expression(exp.SetItem, this=charset, collate=collate, kind="NAMES")
 
-        def _parse_type(self, parse_interval: bool = True) -> t.Optional[exp.Expression]:
+        def _parse_type(
+            self, parse_interval: bool = True, fallback_to_identifier: bool = False
+        ) -> t.Optional[exp.Expression]:
             # mysql binary is special and can work anywhere, even in order by operations
             # it operates like a no paren func
             if self._match(TokenType.BINARY, advance=False):
@@ -604,56 +716,26 @@ class MySQL(Dialect):
                 if isinstance(data_type, exp.DataType):
                     return self.expression(exp.Cast, this=self._parse_column(), to=data_type)
 
-            return super()._parse_type(parse_interval=parse_interval)
+            return super()._parse_type(
+                parse_interval=parse_interval, fallback_to_identifier=fallback_to_identifier
+            )
 
-        def _parse_chr(self) -> t.Optional[exp.Expression]:
-            expressions = self._parse_csv(self._parse_conjunction)
-            kwargs: t.Dict[str, t.Any] = {"this": seq_get(expressions, 0)}
+        def _parse_alter_table_alter_index(self) -> exp.AlterIndex:
+            index = self._parse_field(any_token=True)
 
-            if len(expressions) > 1:
-                kwargs["expressions"] = expressions[1:]
-
-            if self._match(TokenType.USING):
-                kwargs["charset"] = self._parse_var()
-
-            return self.expression(exp.Chr, **kwargs)
-
-        def _parse_group_concat(self) -> t.Optional[exp.Expression]:
-            def concat_exprs(
-                node: t.Optional[exp.Expression], exprs: t.List[exp.Expression]
-            ) -> exp.Expression:
-                if isinstance(node, exp.Distinct) and len(node.expressions) > 1:
-                    concat_exprs = [
-                        self.expression(exp.Concat, expressions=node.expressions, safe=True)
-                    ]
-                    node.set("expressions", concat_exprs)
-                    return node
-                if len(exprs) == 1:
-                    return exprs[0]
-                return self.expression(exp.Concat, expressions=args, safe=True)
-
-            args = self._parse_csv(self._parse_lambda)
-
-            if args:
-                order = args[-1] if isinstance(args[-1], exp.Order) else None
-
-                if order:
-                    # Order By is the last (or only) expression in the list and has consumed the 'expr' before it,
-                    # remove 'expr' from exp.Order and add it back to args
-                    args[-1] = order.this
-                    order.set("this", concat_exprs(order.this, args))
-
-                this = order or concat_exprs(args[0], args)
+            if self._match_text_seq("VISIBLE"):
+                visible = True
+            elif self._match_text_seq("INVISIBLE"):
+                visible = False
             else:
-                this = None
+                visible = None
 
-            separator = self._parse_field() if self._match(TokenType.SEPARATOR) else None
-
-            return self.expression(exp.GroupConcat, this=this, separator=separator)
+            return self.expression(exp.AlterIndex, this=index, visible=visible)
 
     class Generator(generator.Generator):
+        INTERVAL_ALLOWS_PLURAL_FORM = False
         LOCKING_READS_SUPPORTED = True
-        NULL_ORDERING_SUPPORTED = None
+        NULL_ORDERING_SUPPORTED: t.Optional[bool] = None
         JOIN_HINTS = False
         TABLE_HINTS = True
         DUPLICATE_KEY_UPDATE_WITH_SET = False
@@ -665,10 +747,21 @@ class MySQL(Dialect):
         JSON_PATH_BRACKETED_KEY_SUPPORTED = False
         JSON_KEY_VALUE_PAIR_SEP = ","
         SUPPORTS_TO_NUMBER = False
+        PARSE_JSON_NAME: t.Optional[str] = None
+        PAD_FILL_PATTERN_IS_REQUIRED = True
+        WRAP_DERIVED_VALUES = False
+        VARCHAR_REQUIRES_SIZE = True
+        SUPPORTS_MEDIAN = False
+        UPDATE_STATEMENT_SUPPORTS_FROM = False
 
         TRANSFORMS = {
             **generator.Generator.TRANSFORMS,
             exp.ArrayAgg: rename_func("GROUP_CONCAT"),
+            exp.BitwiseAndAgg: rename_func("BIT_AND"),
+            exp.BitwiseOrAgg: rename_func("BIT_OR"),
+            exp.BitwiseXorAgg: rename_func("BIT_XOR"),
+            exp.BitwiseCount: rename_func("BIT_COUNT"),
+            exp.Chr: lambda self, e: self.chr_sql(e, "CHAR"),
             exp.CurrentDate: no_paren_current_date_sql,
             exp.DateDiff: _remove_ts_or_ds_to_date(
                 lambda self, e: self.func("DATEDIFF", e.this, e.expression), ("this", "expression")
@@ -685,12 +778,15 @@ class MySQL(Dialect):
             e: f"""GROUP_CONCAT({self.sql(e, "this")} SEPARATOR {self.sql(e, "separator") or "','"})""",
             exp.ILike: no_ilike_sql,
             exp.JSONExtractScalar: arrow_json_extract_sql,
+            exp.Length: length_or_char_length_sql,
+            exp.LogicalOr: rename_func("MAX"),
+            exp.LogicalAnd: rename_func("MIN"),
             exp.Max: max_or_greatest,
             exp.Min: min_or_least,
             exp.Month: _remove_ts_or_ds_to_date(),
             exp.NullSafeEQ: lambda self, e: self.binary(e, "<=>"),
             exp.NullSafeNEQ: lambda self, e: f"NOT {self.binary(e, '<=>')}",
-            exp.ParseJSON: lambda self, e: self.sql(e, "this"),
+            exp.NumberToStr: rename_func("FORMAT"),
             exp.Pivot: no_pivot_sql,
             exp.Select: transforms.preprocess(
                 [
@@ -698,12 +794,16 @@ class MySQL(Dialect):
                     transforms.eliminate_semi_and_anti_joins,
                     transforms.eliminate_qualify,
                     transforms.eliminate_full_outer_join,
+                    transforms.unnest_generate_date_array_using_recursive_cte,
                 ]
             ),
-            exp.StrPosition: strposition_to_locate_sql,
+            exp.StrPosition: lambda self, e: strposition_sql(
+                self, e, func_name="LOCATE", supports_position=True
+            ),
             exp.StrToDate: _str_to_date_sql,
             exp.StrToTime: _str_to_date_sql,
             exp.Stuff: rename_func("INSERT"),
+            exp.SessionUser: lambda *_: "SESSION_USER()",
             exp.TableSample: no_tablesample_sql,
             exp.TimeFromParts: rename_func("MAKETIME"),
             exp.TimestampAdd: date_add_interval_sql("DATE", "ADD"),
@@ -712,21 +812,26 @@ class MySQL(Dialect):
             ),
             exp.TimestampSub: date_add_interval_sql("DATE", "SUB"),
             exp.TimeStrToUnix: rename_func("UNIX_TIMESTAMP"),
-            exp.TimeStrToTime: lambda self, e: self.sql(
-                exp.cast(e.this, exp.DataType.Type.DATETIME, copy=True)
+            exp.TimeStrToTime: lambda self, e: timestrtotime_sql(
+                self,
+                e,
+                include_precision=not e.args.get("zone"),
             ),
             exp.TimeToStr: _remove_ts_or_ds_to_date(
                 lambda self, e: self.func("DATE_FORMAT", e.this, self.format_time(e))
             ),
-            exp.Trim: _trim_sql,
+            exp.Trim: trim_sql,
             exp.TryCast: no_trycast_sql,
             exp.TsOrDsAdd: date_add_sql("ADD"),
             exp.TsOrDsDiff: lambda self, e: self.func("DATEDIFF", e.this, e.expression),
             exp.TsOrDsToDate: _ts_or_ds_to_date_sql,
-            exp.UnixToTime: lambda self, e: self.func("FROM_UNIXTIME", e.this, self.format_time(e)),
+            exp.Unicode: lambda self, e: f"ORD(CONVERT({self.sql(e.this)} USING utf32))",
+            exp.UnixToTime: _unix_to_time_sql,
             exp.Week: _remove_ts_or_ds_to_date(),
             exp.WeekOfYear: _remove_ts_or_ds_to_date(rename_func("WEEKOFYEAR")),
             exp.Year: _remove_ts_or_ds_to_date(),
+            exp.UtcTimestamp: rename_func("UTC_TIMESTAMP"),
+            exp.UtcTime: rename_func("UTC_TIME"),
         }
 
         UNSIGNED_TYPE_MAPPING = {
@@ -736,10 +841,14 @@ class MySQL(Dialect):
             exp.DataType.Type.USMALLINT: "SMALLINT",
             exp.DataType.Type.UTINYINT: "TINYINT",
             exp.DataType.Type.UDECIMAL: "DECIMAL",
+            exp.DataType.Type.UDOUBLE: "DOUBLE",
         }
 
         TIMESTAMP_TYPE_MAPPING = {
+            exp.DataType.Type.DATETIME2: "DATETIME",
+            exp.DataType.Type.SMALLDATETIME: "DATETIME",
             exp.DataType.Type.TIMESTAMP: "DATETIME",
+            exp.DataType.Type.TIMESTAMPNTZ: "DATETIME",
             exp.DataType.Type.TIMESTAMPTZ: "TIMESTAMP",
             exp.DataType.Type.TIMESTAMPLTZ: "TIMESTAMP",
         }
@@ -753,6 +862,7 @@ class MySQL(Dialect):
         TYPE_MAPPING.pop(exp.DataType.Type.MEDIUMTEXT)
         TYPE_MAPPING.pop(exp.DataType.Type.LONGTEXT)
         TYPE_MAPPING.pop(exp.DataType.Type.TINYTEXT)
+        TYPE_MAPPING.pop(exp.DataType.Type.BLOB)
         TYPE_MAPPING.pop(exp.DataType.Type.MEDIUMBLOB)
         TYPE_MAPPING.pop(exp.DataType.Type.LONGBLOB)
         TYPE_MAPPING.pop(exp.DataType.Type.TINYBLOB)
@@ -805,6 +915,287 @@ class MySQL(Dialect):
             exp.DataType.Type.TIMESTAMPLTZ,
         }
 
+        # https://dev.mysql.com/doc/refman/8.0/en/keywords.html
+        RESERVED_KEYWORDS = {
+            "accessible",
+            "add",
+            "all",
+            "alter",
+            "analyze",
+            "and",
+            "as",
+            "asc",
+            "asensitive",
+            "before",
+            "between",
+            "bigint",
+            "binary",
+            "blob",
+            "both",
+            "by",
+            "call",
+            "cascade",
+            "case",
+            "change",
+            "char",
+            "character",
+            "check",
+            "collate",
+            "column",
+            "condition",
+            "constraint",
+            "continue",
+            "convert",
+            "create",
+            "cross",
+            "cube",
+            "cume_dist",
+            "current_date",
+            "current_time",
+            "current_timestamp",
+            "current_user",
+            "cursor",
+            "database",
+            "databases",
+            "day_hour",
+            "day_microsecond",
+            "day_minute",
+            "day_second",
+            "dec",
+            "decimal",
+            "declare",
+            "default",
+            "delayed",
+            "delete",
+            "dense_rank",
+            "desc",
+            "describe",
+            "deterministic",
+            "distinct",
+            "distinctrow",
+            "div",
+            "double",
+            "drop",
+            "dual",
+            "each",
+            "else",
+            "elseif",
+            "empty",
+            "enclosed",
+            "escaped",
+            "except",
+            "exists",
+            "exit",
+            "explain",
+            "false",
+            "fetch",
+            "first_value",
+            "float",
+            "float4",
+            "float8",
+            "for",
+            "force",
+            "foreign",
+            "from",
+            "fulltext",
+            "function",
+            "generated",
+            "get",
+            "grant",
+            "group",
+            "grouping",
+            "groups",
+            "having",
+            "high_priority",
+            "hour_microsecond",
+            "hour_minute",
+            "hour_second",
+            "if",
+            "ignore",
+            "in",
+            "index",
+            "infile",
+            "inner",
+            "inout",
+            "insensitive",
+            "insert",
+            "int",
+            "int1",
+            "int2",
+            "int3",
+            "int4",
+            "int8",
+            "integer",
+            "intersect",
+            "interval",
+            "into",
+            "io_after_gtids",
+            "io_before_gtids",
+            "is",
+            "iterate",
+            "join",
+            "json_table",
+            "key",
+            "keys",
+            "kill",
+            "lag",
+            "last_value",
+            "lateral",
+            "lead",
+            "leading",
+            "leave",
+            "left",
+            "like",
+            "limit",
+            "linear",
+            "lines",
+            "load",
+            "localtime",
+            "localtimestamp",
+            "lock",
+            "long",
+            "longblob",
+            "longtext",
+            "loop",
+            "low_priority",
+            "master_bind",
+            "master_ssl_verify_server_cert",
+            "match",
+            "maxvalue",
+            "mediumblob",
+            "mediumint",
+            "mediumtext",
+            "middleint",
+            "minute_microsecond",
+            "minute_second",
+            "mod",
+            "modifies",
+            "natural",
+            "not",
+            "no_write_to_binlog",
+            "nth_value",
+            "ntile",
+            "null",
+            "numeric",
+            "of",
+            "on",
+            "optimize",
+            "optimizer_costs",
+            "option",
+            "optionally",
+            "or",
+            "order",
+            "out",
+            "outer",
+            "outfile",
+            "over",
+            "partition",
+            "percent_rank",
+            "precision",
+            "primary",
+            "procedure",
+            "purge",
+            "range",
+            "rank",
+            "read",
+            "reads",
+            "read_write",
+            "real",
+            "recursive",
+            "references",
+            "regexp",
+            "release",
+            "rename",
+            "repeat",
+            "replace",
+            "require",
+            "resignal",
+            "restrict",
+            "return",
+            "revoke",
+            "right",
+            "rlike",
+            "row",
+            "rows",
+            "row_number",
+            "schema",
+            "schemas",
+            "second_microsecond",
+            "select",
+            "sensitive",
+            "separator",
+            "set",
+            "show",
+            "signal",
+            "smallint",
+            "spatial",
+            "specific",
+            "sql",
+            "sqlexception",
+            "sqlstate",
+            "sqlwarning",
+            "sql_big_result",
+            "sql_calc_found_rows",
+            "sql_small_result",
+            "ssl",
+            "starting",
+            "stored",
+            "straight_join",
+            "system",
+            "table",
+            "terminated",
+            "then",
+            "tinyblob",
+            "tinyint",
+            "tinytext",
+            "to",
+            "trailing",
+            "trigger",
+            "true",
+            "undo",
+            "union",
+            "unique",
+            "unlock",
+            "unsigned",
+            "update",
+            "usage",
+            "use",
+            "using",
+            "utc_date",
+            "utc_time",
+            "utc_timestamp",
+            "values",
+            "varbinary",
+            "varchar",
+            "varcharacter",
+            "varying",
+            "virtual",
+            "when",
+            "where",
+            "while",
+            "window",
+            "with",
+            "write",
+            "xor",
+            "year_month",
+            "zerofill",
+        }
+
+        def computedcolumnconstraint_sql(self, expression: exp.ComputedColumnConstraint) -> str:
+            persisted = "STORED" if expression.args.get("persisted") else "VIRTUAL"
+            return f"GENERATED ALWAYS AS ({self.sql(expression.this.unnest())}) {persisted}"
+
+        def array_sql(self, expression: exp.Array) -> str:
+            self.unsupported("Arrays are not supported by MySQL")
+            return self.function_fallback_sql(expression)
+
+        def arraycontainsall_sql(self, expression: exp.ArrayContainsAll) -> str:
+            self.unsupported("Array operations are not supported by MySQL")
+            return self.function_fallback_sql(expression)
+
+        def dpipe_sql(self, expression: exp.DPipe) -> str:
+            return self.func("CONCAT", *expression.flatten())
+
         def extract_sql(self, expression: exp.Extract) -> str:
             unit = expression.name
             if unit and unit.lower() == "epoch":
@@ -813,10 +1204,19 @@ class MySQL(Dialect):
             return super().extract_sql(expression)
 
         def datatype_sql(self, expression: exp.DataType) -> str:
+            if (
+                self.VARCHAR_REQUIRES_SIZE
+                and expression.is_type(exp.DataType.Type.VARCHAR)
+                and not expression.expressions
+            ):
+                # `VARCHAR` must always have a size - if it doesn't, we always generate `TEXT`
+                return "TEXT"
+
             # https://dev.mysql.com/doc/refman/8.0/en/numeric-type-syntax.html
             result = super().datatype_sql(expression)
             if expression.this in self.UNSIGNED_TYPE_MAPPING:
                 result = f"{result} UNSIGNED"
+
             return result
 
         def jsonarraycontains_sql(self, expression: exp.JSONArrayContains) -> str:
@@ -835,7 +1235,7 @@ class MySQL(Dialect):
         def show_sql(self, expression: exp.Show) -> str:
             this = f" {expression.name}"
             full = " FULL" if expression.args.get("full") else ""
-            global_ = " GLOBAL" if expression.args.get("global") else ""
+            global_ = " GLOBAL" if expression.args.get("global_") else ""
 
             target = self.sql(expression, "target")
             target = f" {target}" if target else ""
@@ -843,6 +1243,10 @@ class MySQL(Dialect):
                 target = f" FROM{target}"
             elif expression.name == "GRANTS":
                 target = f" FOR{target}"
+            elif expression.name in ("LINKS", "PARTITIONS"):
+                target = f" ON{target}" if target else ""
+            elif expression.name == "PROJECTIONS":
+                target = f" ON TABLE{target}" if target else ""
 
             db = self._prefixed_sql("FROM", expression, "db")
 
@@ -870,7 +1274,14 @@ class MySQL(Dialect):
             else:
                 mutex_or_status = ""
 
-            return f"SHOW{full}{global_}{this}{target}{types}{db}{query}{log}{position}{channel}{mutex_or_status}{like}{where}{offset}{limit}"
+            for_table = self._prefixed_sql("FOR TABLE", expression, "for_table")
+            for_group = self._prefixed_sql("FOR GROUP", expression, "for_group")
+            for_user = self._prefixed_sql("FOR USER", expression, "for_user")
+            for_role = self._prefixed_sql("FOR ROLE", expression, "for_role")
+            into_outfile = self._prefixed_sql("INTO OUTFILE", expression, "into_outfile")
+            json = " JSON" if expression.args.get("json") else ""
+
+            return f"SHOW{full}{global_}{this}{json}{target}{for_table}{types}{db}{query}{log}{position}{channel}{mutex_or_status}{like}{where}{offset}{limit}{for_group}{for_user}{for_role}{into_outfile}"
 
         def altercolumn_sql(self, expression: exp.AlterColumn) -> str:
             dtype = self.sql(expression, "dtype")
@@ -892,12 +1303,6 @@ class MySQL(Dialect):
                 return f" LIMIT {limit_offset}"
             return ""
 
-        def chr_sql(self, expression: exp.Chr) -> str:
-            this = self.expressions(sqls=[expression.this] + expression.expressions)
-            charset = expression.args.get("charset")
-            using = f" USING {self.sql(charset)}" if charset else ""
-            return f"CHAR({this}{using})"
-
         def timestamptrunc_sql(self, expression: exp.TimestampTrunc) -> str:
             unit = expression.args.get("unit")
 
@@ -910,3 +1315,26 @@ class MySQL(Dialect):
             dateadd = build_date_delta_with_interval(exp.DateAdd)([start_ts, interval])
 
             return self.sql(dateadd)
+
+        def converttimezone_sql(self, expression: exp.ConvertTimezone) -> str:
+            from_tz = expression.args.get("source_tz")
+            to_tz = expression.args.get("target_tz")
+            dt = expression.args.get("timestamp")
+
+            return self.func("CONVERT_TZ", dt, from_tz, to_tz)
+
+        def attimezone_sql(self, expression: exp.AtTimeZone) -> str:
+            self.unsupported("AT TIME ZONE is not supported by MySQL")
+            return self.sql(expression.this)
+
+        def isascii_sql(self, expression: exp.IsAscii) -> str:
+            return f"REGEXP_LIKE({self.sql(expression.this)}, '^[[:ascii:]]*$')"
+
+        def ignorenulls_sql(self, expression: exp.IgnoreNulls) -> str:
+            # https://dev.mysql.com/doc/refman/8.4/en/window-function-descriptions.html
+            self.unsupported("MySQL does not support IGNORE NULLS.")
+            return self.sql(expression.this)
+
+        @unsupported_args("this")
+        def currentschema_sql(self, expression: exp.CurrentSchema) -> str:
+            return self.func("SCHEMA")

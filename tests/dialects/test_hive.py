@@ -1,4 +1,5 @@
 from tests.dialects.test_dialect import Validator
+from sqlglot import exp
 
 
 class TestHive(Validator):
@@ -159,11 +160,58 @@ class TestHive(Validator):
             "CREATE TABLE test STORED AS parquet TBLPROPERTIES ('x'='1', 'Z'='2') AS SELECT 1",
             write={
                 "duckdb": "CREATE TABLE test AS SELECT 1",
-                "presto": "CREATE TABLE test WITH (FORMAT='PARQUET', x='1', Z='2') AS SELECT 1",
+                "presto": "CREATE TABLE test WITH (format='parquet', x='1', Z='2') AS SELECT 1",
                 "hive": "CREATE TABLE test STORED AS PARQUET TBLPROPERTIES ('x'='1', 'Z'='2') AS SELECT 1",
-                "spark": "CREATE TABLE test USING PARQUET TBLPROPERTIES ('x'='1', 'Z'='2') AS SELECT 1",
+                "spark": "CREATE TABLE test STORED AS PARQUET TBLPROPERTIES ('x'='1', 'Z'='2') AS SELECT 1",
             },
         )
+
+        self.validate_all(
+            "CREATE TABLE test STORED AS INPUTFORMAT 'foo1' OUTPUTFORMAT 'foo2'",
+            write={
+                "hive": "CREATE TABLE test STORED AS INPUTFORMAT 'foo1' OUTPUTFORMAT 'foo2'",
+                "spark": "CREATE TABLE test STORED AS INPUTFORMAT 'foo1' OUTPUTFORMAT 'foo2'",
+                "databricks": "CREATE TABLE test STORED AS INPUTFORMAT 'foo1' OUTPUTFORMAT 'foo2'",
+            },
+        )
+
+        self.validate_identity("ALTER TABLE x PARTITION(y = z) ADD COLUMN a VARCHAR(10)")
+        self.validate_identity(
+            "ALTER TABLE x CHANGE a a VARCHAR(10)",
+            "ALTER TABLE x CHANGE COLUMN a a VARCHAR(10)",
+        )
+
+        self.validate_all(
+            "ALTER TABLE x CHANGE COLUMN a a VARCHAR(10)",
+            write={
+                "hive": "ALTER TABLE x CHANGE COLUMN a a VARCHAR(10)",
+                "spark": "ALTER TABLE x ALTER COLUMN a TYPE VARCHAR(10)",
+            },
+        )
+        self.validate_all(
+            "ALTER TABLE x CHANGE COLUMN a a VARCHAR(10) COMMENT 'comment'",
+            write={
+                "hive": "ALTER TABLE x CHANGE COLUMN a a VARCHAR(10) COMMENT 'comment'",
+                "spark": "ALTER TABLE x ALTER COLUMN a COMMENT 'comment'",
+            },
+        )
+        self.validate_all(
+            "ALTER TABLE x CHANGE COLUMN a b VARCHAR(10)",
+            write={
+                "hive": "ALTER TABLE x CHANGE COLUMN a b VARCHAR(10)",
+                "spark": "ALTER TABLE x RENAME COLUMN a TO b",
+            },
+        )
+        self.validate_all(
+            "ALTER TABLE x CHANGE COLUMN a a VARCHAR(10) CASCADE",
+            write={
+                "hive": "ALTER TABLE x CHANGE COLUMN a a VARCHAR(10) CASCADE",
+                "spark": "ALTER TABLE x ALTER COLUMN a TYPE VARCHAR(10)",
+            },
+        )
+
+        self.validate_identity("ALTER TABLE X ADD COLUMNS (y INT, z STRING)")
+        self.validate_identity("ALTER TABLE X ADD COLUMNS (y INT, z STRING) CASCADE")
 
         self.validate_identity(
             """CREATE EXTERNAL TABLE x (y INT) ROW FORMAT SERDE 'serde' ROW FORMAT DELIMITED FIELDS TERMINATED BY '1' WITH SERDEPROPERTIES ('input.regex'='')""",
@@ -171,12 +219,61 @@ class TestHive(Validator):
         self.validate_identity(
             """CREATE EXTERNAL TABLE `my_table` (`a7` ARRAY<DATE>) ROW FORMAT SERDE 'a' STORED AS INPUTFORMAT 'b' OUTPUTFORMAT 'c' LOCATION 'd' TBLPROPERTIES ('e'='f')"""
         )
+        self.validate_identity("CREATE EXTERNAL TABLE X (y INT) STORED BY 'x'")
+        self.validate_identity("ALTER VIEW v1 AS SELECT x, UPPER(s) AS s FROM t2")
+        self.validate_identity("ALTER VIEW v1 (c1, c2) AS SELECT x, UPPER(s) AS s FROM t2")
+        self.validate_identity(
+            "ALTER VIEW v7 (c1 COMMENT 'Comment for c1', c2) AS SELECT t1.c1, t1.c2 FROM t1"
+        )
+        self.validate_identity("ALTER VIEW db1.v1 RENAME TO db2.v2")
+        self.validate_identity("ALTER VIEW v1 SET TBLPROPERTIES ('tblp1'='1', 'tblp2'='2')")
+        self.validate_identity(
+            "ALTER VIEW v1 UNSET TBLPROPERTIES ('tblp1', 'tblp2')", check_command_warning=True
+        )
+        self.validate_identity("CREATE TABLE foo (col STRUCT<struct_col_a: VARCHAR((50))>)")
+
+        self.validate_all(
+            "CREATE TABLE db.example_table (col_a struct<struct_col_a:int, struct_col_b:string>)",
+            write={
+                "duckdb": "CREATE TABLE db.example_table (col_a STRUCT(struct_col_a INT, struct_col_b TEXT))",
+                "presto": "CREATE TABLE db.example_table (col_a ROW(struct_col_a INTEGER, struct_col_b VARCHAR))",
+                "hive": "CREATE TABLE db.example_table (col_a STRUCT<struct_col_a: INT, struct_col_b: STRING>)",
+                "spark": "CREATE TABLE db.example_table (col_a STRUCT<struct_col_a: INT, struct_col_b: STRING>)",
+            },
+        )
+
+        self.validate_all(
+            "CREATE TABLE db.example_table (col_a struct<struct_col_a:int, struct_col_b:struct<nested_col_a:string, nested_col_b:string>>)",
+            write={
+                "bigquery": "CREATE TABLE db.example_table (col_a STRUCT<struct_col_a INT64, struct_col_b STRUCT<nested_col_a STRING, nested_col_b STRING>>)",
+                "duckdb": "CREATE TABLE db.example_table (col_a STRUCT(struct_col_a INT, struct_col_b STRUCT(nested_col_a TEXT, nested_col_b TEXT)))",
+                "presto": "CREATE TABLE db.example_table (col_a ROW(struct_col_a INTEGER, struct_col_b ROW(nested_col_a VARCHAR, nested_col_b VARCHAR)))",
+                "hive": "CREATE TABLE db.example_table (col_a STRUCT<struct_col_a: INT, struct_col_b: STRUCT<nested_col_a: STRING, nested_col_b: STRING>>)",
+                "spark": "CREATE TABLE db.example_table (col_a STRUCT<struct_col_a: INT, struct_col_b: STRUCT<nested_col_a: STRING, nested_col_b: STRING>>)",
+            },
+        )
+
+        self.validate_all(
+            "ALTER TABLE db.example_table ADD PARTITION(col_a = 'a') LOCATION 'b'",
+            read={
+                "spark2": "ALTER TABLE db.example_table ADD PARTITION(col_a = 'a') LOCATION 'b'",
+                "spark": "ALTER TABLE db.example_table ADD PARTITION(col_a = 'a') LOCATION 'b'",
+                "databricks": "ALTER TABLE db.example_table ADD PARTITION(col_a = 'a') LOCATION 'b'",
+            },
+            write={
+                "hive": "ALTER TABLE db.example_table ADD PARTITION(col_a = 'a') LOCATION 'b'",
+                "spark2": "ALTER TABLE db.example_table ADD PARTITION(col_a = 'a') LOCATION 'b'",
+                "spark": "ALTER TABLE db.example_table ADD PARTITION(col_a = 'a') LOCATION 'b'",
+                "databricks": "ALTER TABLE db.example_table ADD PARTITION(col_a = 'a') LOCATION 'b'",
+            },
+        )
 
     def test_lateral_view(self):
         self.validate_all(
             "SELECT a, b FROM x LATERAL VIEW EXPLODE(y) t AS a LATERAL VIEW EXPLODE(z) u AS b",
             write={
                 "presto": "SELECT a, b FROM x CROSS JOIN UNNEST(y) AS t(a) CROSS JOIN UNNEST(z) AS u(b)",
+                "duckdb": "SELECT a, b FROM x CROSS JOIN UNNEST(y) AS t(a) CROSS JOIN UNNEST(z) AS u(b)",
                 "hive": "SELECT a, b FROM x LATERAL VIEW EXPLODE(y) t AS a LATERAL VIEW EXPLODE(z) u AS b",
                 "spark": "SELECT a, b FROM x LATERAL VIEW EXPLODE(y) t AS a LATERAL VIEW EXPLODE(z) u AS b",
             },
@@ -185,6 +282,7 @@ class TestHive(Validator):
             "SELECT a FROM x LATERAL VIEW EXPLODE(y) t AS a",
             write={
                 "presto": "SELECT a FROM x CROSS JOIN UNNEST(y) AS t(a)",
+                "duckdb": "SELECT a FROM x CROSS JOIN UNNEST(y) AS t(a)",
                 "hive": "SELECT a FROM x LATERAL VIEW EXPLODE(y) t AS a",
                 "spark": "SELECT a FROM x LATERAL VIEW EXPLODE(y) t AS a",
             },
@@ -201,6 +299,7 @@ class TestHive(Validator):
             "SELECT a FROM x LATERAL VIEW EXPLODE(ARRAY(y)) t AS a",
             write={
                 "presto": "SELECT a FROM x CROSS JOIN UNNEST(ARRAY[y]) AS t(a)",
+                "duckdb": "SELECT a FROM x CROSS JOIN UNNEST([y]) AS t(a)",
                 "hive": "SELECT a FROM x LATERAL VIEW EXPLODE(ARRAY(y)) t AS a",
                 "spark": "SELECT a FROM x LATERAL VIEW EXPLODE(ARRAY(y)) t AS a",
             },
@@ -301,8 +400,8 @@ class TestHive(Validator):
             write={
                 "duckdb": "DATE_DIFF('DAY', CAST(b AS DATE), CAST(a AS DATE))",
                 "presto": "DATE_DIFF('DAY', CAST(CAST(b AS TIMESTAMP) AS DATE), CAST(CAST(a AS TIMESTAMP) AS DATE))",
-                "hive": "DATEDIFF(TO_DATE(a), TO_DATE(b))",
-                "spark": "DATEDIFF(TO_DATE(a), TO_DATE(b))",
+                "hive": "DATEDIFF(a, b)",
+                "spark": "DATEDIFF(a, b)",
                 "": "DATEDIFF(CAST(a AS DATE), CAST(b AS DATE))",
             },
         )
@@ -318,11 +417,11 @@ class TestHive(Validator):
         self.validate_all(
             "DATE_FORMAT('2020-01-01', 'yyyy-MM-dd HH:mm:ss')",
             write={
-                "bigquery": "FORMAT_DATE('%Y-%m-%d %H:%M:%S', CAST('2020-01-01' AS DATETIME))",
+                "bigquery": "FORMAT_DATE('%F %T', CAST('2020-01-01' AS DATETIME))",
                 "duckdb": "STRFTIME(CAST('2020-01-01' AS TIMESTAMP), '%Y-%m-%d %H:%M:%S')",
                 "presto": "DATE_FORMAT(CAST('2020-01-01' AS TIMESTAMP), '%Y-%m-%d %T')",
-                "hive": "DATE_FORMAT(CAST('2020-01-01' AS TIMESTAMP), 'yyyy-MM-dd HH:mm:ss')",
-                "spark": "DATE_FORMAT(CAST('2020-01-01' AS TIMESTAMP), 'yyyy-MM-dd HH:mm:ss')",
+                "hive": "DATE_FORMAT('2020-01-01', 'yyyy-MM-dd HH:mm:ss')",
+                "spark": "DATE_FORMAT('2020-01-01', 'yyyy-MM-dd HH:mm:ss')",
             },
         )
         self.validate_all(
@@ -363,8 +462,8 @@ class TestHive(Validator):
             write={
                 "duckdb": "DATE_DIFF('DAY', CAST(x AS DATE), CAST(y AS DATE))",
                 "presto": "DATE_DIFF('DAY', CAST(CAST(x AS TIMESTAMP) AS DATE), CAST(CAST(CAST(CAST(y AS TIMESTAMP) AS DATE) AS TIMESTAMP) AS DATE))",
-                "hive": "DATEDIFF(TO_DATE(y), TO_DATE(x))",
-                "spark": "DATEDIFF(TO_DATE(y), TO_DATE(x))",
+                "hive": "DATEDIFF(TO_DATE(y), x)",
+                "spark": "DATEDIFF(TO_DATE(y), x)",
                 "": "DATEDIFF(CAST(y AS DATE), CAST(x AS DATE))",
             },
         )
@@ -372,7 +471,7 @@ class TestHive(Validator):
             "UNIX_TIMESTAMP(x)",
             write={
                 "duckdb": "EPOCH(STRPTIME(x, '%Y-%m-%d %H:%M:%S'))",
-                "presto": "TO_UNIXTIME(COALESCE(TRY(DATE_PARSE(CAST(x AS VARCHAR), '%Y-%m-%d %T')), PARSE_DATETIME(CAST(x AS VARCHAR), 'yyyy-MM-dd HH:mm:ss')))",
+                "presto": "TO_UNIXTIME(COALESCE(TRY(DATE_PARSE(CAST(x AS VARCHAR), '%Y-%m-%d %T')), PARSE_DATETIME(DATE_FORMAT(x, '%Y-%m-%d %T'), 'yyyy-MM-dd HH:mm:ss')))",
                 "hive": "UNIX_TIMESTAMP(x)",
                 "spark": "UNIX_TIMESTAMP(x)",
                 "": "STR_TO_UNIX(x, '%Y-%m-%d %H:%M:%S')",
@@ -385,8 +484,8 @@ class TestHive(Validator):
                 write={
                     "duckdb": f"{unit}(CAST(x AS DATE))",
                     "presto": f"{unit}(CAST(CAST(x AS TIMESTAMP) AS DATE))",
-                    "hive": f"{unit}(TO_DATE(x))",
-                    "spark": f"{unit}(TO_DATE(x))",
+                    "hive": f"{unit}(x)",
+                    "spark": f"{unit}(x)",
                 },
             )
 
@@ -402,11 +501,16 @@ class TestHive(Validator):
         )
 
     def test_hive(self):
+        self.validate_identity("TO_DATE(TO_DATE(x))")
+        self.validate_identity("DAY(TO_DATE(x))")
+        self.validate_identity("SELECT * FROM t WHERE col IN ('stream')")
         self.validate_identity("SET hiveconf:some_var = 5", check_command_warning=True)
         self.validate_identity("(VALUES (1 AS a, 2 AS b, 3))")
         self.validate_identity("SELECT * FROM my_table TIMESTAMP AS OF DATE_ADD(CURRENT_DATE, -1)")
         self.validate_identity("SELECT * FROM my_table VERSION AS OF DATE_ADD(CURRENT_DATE, -1)")
-
+        self.validate_identity(
+            "SELECT WEEKOFYEAR('2024-05-22'), DAYOFMONTH('2024-05-22'), DAYOFWEEK('2024-05-22')"
+        )
         self.validate_identity(
             "SELECT ROW() OVER (DISTRIBUTE BY x SORT BY y)",
             "SELECT ROW() OVER (PARTITION BY x ORDER BY y)",
@@ -448,6 +552,10 @@ class TestHive(Validator):
         )
         self.validate_identity(
             "TRUNCATE TABLE t1 PARTITION(age = 10, name = 'test', address = 'abc')"
+        )
+        self.validate_identity(
+            "SELECT * FROM t1, t2",
+            "SELECT * FROM t1 CROSS JOIN t2",
         )
 
         self.validate_all(
@@ -546,7 +654,7 @@ class TestHive(Validator):
                 "presto": "CONTAINS(x, 1)",
                 "hive": "ARRAY_CONTAINS(x, 1)",
                 "spark": "ARRAY_CONTAINS(x, 1)",
-                "snowflake": "ARRAY_CONTAINS(1, x)",
+                "snowflake": "ARRAY_CONTAINS(CAST(1 AS VARIANT), x)",
             },
         )
         self.validate_all(
@@ -570,35 +678,31 @@ class TestHive(Validator):
         self.validate_all(
             "LOCATE('a', x, 3)",
             write={
-                "duckdb": "STRPOS(SUBSTR(x, 3), 'a') + 3 - 1",
-                "presto": "STRPOS(SUBSTR(x, 3), 'a') + 3 - 1",
+                "duckdb": "CASE WHEN STRPOS(SUBSTRING(x, 3), 'a') = 0 THEN 0 ELSE STRPOS(SUBSTRING(x, 3), 'a') + 3 - 1 END",
+                "presto": "IF(STRPOS(SUBSTRING(x, 3), 'a') = 0, 0, STRPOS(SUBSTRING(x, 3), 'a') + 3 - 1)",
                 "hive": "LOCATE('a', x, 3)",
                 "spark": "LOCATE('a', x, 3)",
             },
         )
+
         self.validate_all(
             "INITCAP('new york')",
             write={
-                "duckdb": "INITCAP('new york')",
-                "presto": r"REGEXP_REPLACE('new york', '(\w)(\w*)', x -> UPPER(x[1]) || LOWER(x[2]))",
                 "hive": "INITCAP('new york')",
                 "spark": "INITCAP('new york')",
             },
+        )
+        expression = self.parse_one("INITCAP('new york')")
+        self.assert_duckdb_sql(
+            expression,
+            includes=("REGEXP_MATCHES(", "ARRAY_TO_STRING("),
+            chr_chars=("\u000b", "\u001c", "\u001d", "\u001e", "\u001f"),
         )
         self.validate_all(
             "SELECT * FROM x.z TABLESAMPLE(10 PERCENT) y",
             write={
                 "hive": "SELECT * FROM x.z TABLESAMPLE (10 PERCENT) AS y",
                 "spark": "SELECT * FROM x.z TABLESAMPLE (10 PERCENT) AS y",
-            },
-        )
-        self.validate_all(
-            "SELECT SORT_ARRAY(x)",
-            write={
-                "duckdb": "SELECT ARRAY_SORT(x)",
-                "presto": "SELECT ARRAY_SORT(x)",
-                "hive": "SELECT SORT_ARRAY(x)",
-                "spark": "SELECT SORT_ARRAY(x)",
             },
         )
         self.validate_all(
@@ -689,12 +793,20 @@ class TestHive(Validator):
             },
         )
         self.validate_all(
-            "x div y",
+            "x DIV y",
+            read={
+                "databricks": "x DIV y",
+                "duckdb": "x // y",
+                "hive": "x DIV y",
+                "spark2": "x DIV y",
+                "spark": "x DIV y",
+            },
             write={
                 "duckdb": "x // y",
+                "databricks": "x DIV y",
                 "presto": "CAST(CAST(x AS DOUBLE) / y AS INTEGER)",
-                "hive": "CAST(x / y AS INT)",
-                "spark": "CAST(x / y AS INT)",
+                "spark2": "x DIV y",
+                "spark": "x DIV y",
             },
         )
         self.validate_all(
@@ -703,8 +815,8 @@ class TestHive(Validator):
                 "presto": "ARRAY_AGG(x)",
             },
             write={
-                "duckdb": "ARRAY_AGG(x)",
-                "presto": "ARRAY_AGG(x)",
+                "duckdb": "ARRAY_AGG(x) FILTER(WHERE x IS NOT NULL)",
+                "presto": "ARRAY_AGG(x) FILTER(WHERE x IS NOT NULL)",
                 "hive": "COLLECT_LIST(x)",
                 "spark": "COLLECT_LIST(x)",
             },
@@ -722,6 +834,7 @@ class TestHive(Validator):
                 "presto": "SET_AGG(x)",
                 "snowflake": "ARRAY_UNIQUE_AGG(x)",
                 "spark": "COLLECT_SET(x)",
+                "trino": "ARRAY_AGG(DISTINCT x)",
             },
         )
         self.validate_all(
@@ -739,9 +852,88 @@ class TestHive(Validator):
         self.validate_all(
             "SELECT a, SUM(c) FROM t GROUP BY a, DATE_FORMAT(b, 'yyyy'), GROUPING SETS ((a, DATE_FORMAT(b, 'yyyy')), a)",
             write={
-                "hive": "SELECT a, SUM(c) FROM t GROUP BY a, DATE_FORMAT(CAST(b AS TIMESTAMP), 'yyyy'), GROUPING SETS ((a, DATE_FORMAT(CAST(b AS TIMESTAMP), 'yyyy')), a)",
+                "hive": "SELECT a, SUM(c) FROM t GROUP BY a, DATE_FORMAT(b, 'yyyy'), GROUPING SETS ((a, DATE_FORMAT(b, 'yyyy')), a)",
             },
         )
+        self.validate_all(
+            "SELECT TRUNC(CAST(ds AS TIMESTAMP), 'MONTH')",
+            read={
+                "hive": "SELECT TRUNC(CAST(ds AS TIMESTAMP), 'MONTH')",
+                "presto": "SELECT DATE_TRUNC('MONTH', CAST(ds AS TIMESTAMP))",
+            },
+            write={
+                "presto": "SELECT DATE_TRUNC('MONTH', TRY_CAST(ds AS TIMESTAMP))",
+            },
+        )
+        self.validate_all(
+            "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+            read={
+                "hive": "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+                "spark2": "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+                "spark": "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+                "databricks": "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+            },
+            write={
+                "hive": "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+                "spark2": "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+                "spark": "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+                "databricks": "REGEXP_EXTRACT('abc', '(a)(b)(c)')",
+                "presto": "REGEXP_EXTRACT('abc', '(a)(b)(c)', 1)",
+                "trino": "REGEXP_EXTRACT('abc', '(a)(b)(c)', 1)",
+                "duckdb": "REGEXP_EXTRACT('abc', '(a)(b)(c)', 1)",
+            },
+        )
+
+        self.validate_identity("EXISTS(col, x -> x % 2 = 0)").assert_is(exp.Exists)
+
+        self.validate_all(
+            "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+            read={
+                "hive": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+                "spark2": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+                "spark": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+                "databricks": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+            },
+            write={
+                "spark2": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+                "spark": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+                "databricks": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+            },
+        )
+
+        self.validate_identity("SELECT 1_2")
+
+        self.validate_all(
+            "SELECT MAP(*), STRUCT(*) FROM t",
+            read={
+                "hive": "SELECT MAP(*), STRUCT(*) FROM t",
+                "spark2": "SELECT MAP(*), STRUCT(*) FROM t",
+                "spark": "SELECT MAP(*), STRUCT(*) FROM t",
+                "databricks": "SELECT MAP(*), STRUCT(*) FROM t",
+            },
+            write={
+                "spark2": "SELECT MAP(*), STRUCT(*) FROM t",
+                "spark": "SELECT MAP(*), STRUCT(*) FROM t",
+                "databricks": "SELECT MAP(*), STRUCT(*) FROM t",
+            },
+        )
+
+        self.validate_all(
+            "SELECT FIRST(sample_col) IGNORE NULLS",
+            read={
+                "hive": "SELECT FIRST(sample_col, TRUE)",
+                "spark2": "SELECT FIRST(sample_col, TRUE)",
+                "spark": "SELECT FIRST(sample_col, TRUE)",
+                "databricks": "SELECT FIRST(sample_col, TRUE)",
+            },
+            write={
+                "duckdb": "SELECT ANY_VALUE(sample_col)",
+            },
+        )
+        self.validate_identity(
+            "DATE_SUB(CURRENT_DATE, 1 + 1)", "DATE_ADD(CURRENT_DATE, (1 + 1) * -1)"
+        )
+        self.validate_identity("SELECT ELT(2, 'foo', 'bar', 'baz') AS Result")
 
     def test_escapes(self) -> None:
         self.validate_identity("'\n'", "'\\n'")
@@ -759,3 +951,25 @@ class TestHive(Validator):
                 "hive": "CAST(a AS BOOLEAN)",
             },
         )
+
+    def test_joins_without_on(self):
+        for join in ("FULL OUTER", "LEFT", "RIGHT", "LEFT OUTER", "RIGHT OUTER", "INNER"):
+            with self.subTest(f"Testing transpilation of {join} without ON"):
+                self.validate_all(
+                    f"SELECT * FROM t1 {join} JOIN t2 ON TRUE",
+                    read={
+                        "hive": f"SELECT * FROM t1 {join} JOIN t2",
+                        "spark2": f"SELECT * FROM t1 {join} JOIN t2",
+                        "spark": f"SELECT * FROM t1 {join} JOIN t2",
+                        "databricks": f"SELECT * FROM t1 {join} JOIN t2",
+                        "sqlite": f"SELECT * FROM t1 {join} JOIN t2",
+                    },
+                    write={
+                        "hive": f"SELECT * FROM t1 {join} JOIN t2 ON TRUE",
+                        "spark2": f"SELECT * FROM t1 {join} JOIN t2 ON TRUE",
+                        "spark": f"SELECT * FROM t1 {join} JOIN t2 ON TRUE",
+                        "databricks": f"SELECT * FROM t1 {join} JOIN t2 ON TRUE",
+                        "sqlite": f"SELECT * FROM t1 {join} JOIN t2 ON TRUE",
+                        "duckdb": f"SELECT * FROM t1 {join} JOIN t2 ON TRUE",
+                    },
+                )

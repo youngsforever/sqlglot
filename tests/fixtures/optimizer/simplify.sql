@@ -2,16 +2,16 @@
 -- Conditions
 --------------------------------------
 x AND x;
-x;
+x AND TRUE;
 
 y OR y;
-y;
+y AND TRUE;
 
 x AND NOT x;
-FALSE;
+NOT x AND x;
 
 x OR NOT x;
-TRUE;
+NOT x OR x;
 
 1 AND TRUE;
 TRUE;
@@ -56,22 +56,22 @@ STRUCT(NULL AS a);
 STRUCT(NULL AS a);
 
 NULL AND TRUE;
-NULL;
+NULL AND TRUE;
 
 NULL AND FALSE;
 FALSE;
 
 NULL AND NULL;
-NULL;
+NULL AND TRUE;
 
 NULL OR TRUE;
 TRUE;
 
 NULL OR NULL;
-NULL;
+NULL AND TRUE;
 
 FALSE OR NULL;
-NULL;
+NULL AND TRUE;
 
 NOT TRUE;
 FALSE;
@@ -80,10 +80,37 @@ NOT FALSE;
 TRUE;
 
 NOT NULL;
-NULL;
+NULL AND TRUE;
 
 NULL = NULL;
-NULL;
+NULL = NULL;
+
+SELECT (EXISTS(SELECT 1 WHERE FALSE)) AND NULL;
+SELECT EXISTS(SELECT 1 WHERE FALSE) AND NULL;
+
+SELECT NULL AND (EXISTS(SELECT 1 WHERE FALSE));
+SELECT EXISTS(SELECT 1 WHERE FALSE) AND NULL;
+
+1 AND 0;
+FALSE;
+
+0 AND 1;
+FALSE;
+
+0 OR 1;
+TRUE;
+
+0 OR NULL;
+NULL AND TRUE;
+
+NULL OR 0;
+NULL AND TRUE;
+
+0 AND NULL;
+FALSE;
+
+NULL AND 0;
+FALSE;
 
 -- Can't optimize this because different engines do different things
 -- mysql converts to 0 and 1 but tsql does true and false
@@ -111,7 +138,32 @@ a AND b;
 
 # dialect: mysql
 A XOR A;
-FALSE;
+A XOR A;
+
+# dialect: mysql
+SELECT DISTINCT GREATEST(EXISTS(SELECT 1 WHERE FALSE), (EXISTS(SELECT 1 WHERE FALSE)) XOR ((0.08) IN ((t1.c0) XOR (t1.c0)))) AS ref0 FROM (SELECT NULL AS c0 UNION ALL SELECT 1 AS c0) AS t1, (SELECT 0.01 AS c1) AS t0;
+SELECT DISTINCT GREATEST(EXISTS(SELECT 1 WHERE FALSE), 0.08 IN (t1.c0 XOR t1.c0) XOR EXISTS(SELECT 1 WHERE FALSE)) AS ref0 FROM (SELECT NULL AS c0 UNION ALL SELECT 1 AS c0) AS t1, (SELECT 0.01 AS c1) AS t0;
+
+TRUE AND TRUE OR TRUE AND FALSE;
+TRUE;
+
+COALESCE(x, y) <> ALL (SELECT z FROM w);
+COALESCE(x, y) <> ALL (SELECT z FROM w);
+
+SELECT NOT (2 <> ALL (SELECT 2 UNION ALL SELECT 3));
+SELECT 2 = ANY(SELECT 2 UNION ALL SELECT 3);
+
+SELECT t_bool.a AND TRUE FROM t_bool;
+SELECT t_bool.a FROM t_bool;
+
+SELECT TRUE AND t_bool.a FROM t_bool;
+SELECT t_bool.a FROM t_bool;
+
+SELECT t_bool.a OR FALSE FROM t_bool;
+SELECT t_bool.a FROM t_bool;
+
+SELECT FALSE OR t_bool.a FROM t_bool;
+SELECT t_bool.a FROM t_bool;
 
 --------------------------------------
 -- Absorption
@@ -120,7 +172,7 @@ FALSE;
 (A OR B) AND (C OR NOT A);
 
 A AND (A OR B);
-A;
+A AND TRUE;
 
 A AND D AND E AND (B OR A);
 A AND D AND E;
@@ -129,16 +181,16 @@ D AND A AND E AND (B OR A);
 A AND D AND E;
 
 (A OR B) AND A;
-A;
+A AND TRUE;
 
 C AND D AND (A OR B) AND E AND F AND A;
 A AND C AND D AND E AND F;
 
 A OR (A AND B);
-A;
+A AND TRUE;
 
 (A AND B) OR A;
-A;
+A AND TRUE;
 
 A AND (NOT A OR B);
 A AND B;
@@ -147,6 +199,9 @@ A AND B;
 A AND B;
 
 A OR (NOT A AND B);
+A OR B;
+
+A OR ((((NOT A AND B))));
 A OR B;
 
 (A OR C) AND ((A OR C) OR B);
@@ -158,32 +213,38 @@ A OR C;
 A AND (B AND C) AND (D AND E);
 A AND B AND C AND D AND E;
 
+A AND (A OR B) AND (A OR B OR C);
+A AND TRUE;
+
+(A OR B) AND (A OR C) AND (A OR B OR C);
+(A OR B) AND (A OR C);
+
 --------------------------------------
 -- Elimination
 --------------------------------------
 (A AND B) OR (A AND NOT B);
-A;
+A AND TRUE;
 
 (A AND B) OR (NOT A AND B);
-B;
+B AND TRUE;
 
 (A AND NOT B) OR (A AND B);
-A;
+A AND TRUE;
 
 (NOT A AND B) OR (A AND B);
-B;
+B AND TRUE;
 
 (A OR B) AND (A OR NOT B);
-A;
+A AND TRUE;
 
 (A OR B) AND (NOT A OR B);
-B;
+B AND TRUE;
 
 (A OR NOT B) AND (A OR B);
-A;
+A AND TRUE;
 
 (NOT A OR B) AND (A OR B);
-B;
+B AND TRUE;
 
 (NOT A OR NOT B) AND (NOT A OR B);
 NOT A;
@@ -193,6 +254,27 @@ NOT A;
 
 E OR (A AND B) OR C OR D OR (A AND NOT B);
 A OR C OR D OR E;
+
+(A AND B) OR (A AND NOT B) OR (A AND NOT B);
+A AND TRUE;
+
+(A AND B) OR (A AND B) OR (A AND NOT B);
+A AND TRUE;
+
+(A AND B) OR (A AND NOT B) OR (A AND B) OR (A AND NOT B);
+A AND TRUE;
+
+SELECT t_bool.a OR t_bool.a FROM t_bool;
+SELECT t_bool.a FROM t_bool;
+
+SELECT t_bool.a AND t_bool.a FROM t_bool;
+SELECT t_bool.a FROM t_bool;
+
+SELECT SUM(t.x OR t.x) FROM t;
+SELECT SUM(t.x AND TRUE) FROM t;
+
+SELECT SUM(t.x AND t.x) FROM t;
+SELECT SUM(t.x AND TRUE) FROM t;
 
 --------------------------------------
 -- Associativity
@@ -244,7 +326,7 @@ A XOR D XOR B XOR E XOR F XOR G XOR C;
 A XOR B XOR C XOR D XOR E XOR F XOR G;
 
 A AND NOT B AND C AND B;
-FALSE;
+A AND B AND C AND NOT B;
 
 (a AND b AND c AND d) AND (d AND c AND b AND a);
 a AND b AND c AND d;
@@ -317,6 +399,16 @@ x * (1 - y);
 
 ANY(t.value);
 ANY(t.value);
+
+SELECT (ARRAY_AGG(foo))[1];
+SELECT (ARRAY_AGG(foo))[1];
+
+SELECT -(x.a > x.b) FROM x;
+SELECT -(x.a > x.b) FROM x;
+
+SELECT (-((x.a) IS NULL)) FROM x;
+SELECT -(x.a IS NULL) FROM x;
+
 
 --------------------------------------
 -- Literals
@@ -430,10 +522,10 @@ FALSE;
 TRUE;
 
 1 > NULL;
-NULL;
+1 > NULL;
 
 1 <= NULL;
-NULL;
+1 <= NULL;
 
 1 IS NULL;
 FALSE;
@@ -512,6 +604,15 @@ CAST('2023-01-01 22:00:00' AS DATETIME);
 
 DATE_ADD(x, 1, 'MONTH');
 DATE_ADD(x, 1, 'MONTH');
+
+DATE_ADD(x, 1);
+DATE_ADD(x, 1, 'DAY');
+
+SELECT 1 WHERE 'foo';
+SELECT 1 WHERE 'foo';
+
+SELECT 1 WHERE NOT 'foo';
+SELECT 1 WHERE NOT 'foo';
 
 --------------------------------------
 -- Comparisons
@@ -792,6 +893,10 @@ x;
 COALESCE(x, 1) = 2;
 NOT x IS NULL AND x = 2;
 
+# dialect: redshift
+COALESCE(x, 1) = 2;
+COALESCE(x, 1) = 2;
+
 2 = COALESCE(x, 1);
 NOT x IS NULL AND x = 2;
 
@@ -1029,6 +1134,9 @@ x < CAST('2021-01-02' AS DATE) AND x >= CAST('2021-01-01' AS DATE);
 TIMESTAMP_TRUNC(x, YEAR) = CAST(CAST('2021-01-01 01:02:03' AS DATE) AS DATETIME);
 x < CAST('2022-01-01 00:00:00' AS DATETIME) AND x >= CAST('2021-01-01 00:00:00' AS DATETIME);
 
+DATE_TRUNC('day', CAST(x AS DATE)) <= CAST('2021-01-01 01:02:03' AS TIMESTAMP);
+CAST(x AS DATE) < CAST('2021-01-02 01:02:03' AS TIMESTAMP);
+
 --------------------------------------
 -- EQUALITY
 --------------------------------------
@@ -1238,3 +1346,66 @@ STARTS_WITH('x', y);
 
 STARTS_WITH(x, 'y');
 STARTS_WITH(x, 'y');
+
+--------------------------------------
+-- Simplify NOT
+--------------------------------------
+SELECT NOT(NOT(a)) FROM x;
+SELECT NOT NOT a FROM x;
+
+SELECT NOT(NOT(NOT(NOT t_bool.a))) FROM t_bool;
+SELECT t_bool.a FROM t_bool;
+
+# dialect: mysql
+SELECT NOT(NOT(NOT(NOT t_bool.a))) FROM t_bool;
+SELECT NOT NOT NOT NOT t_bool.a FROM t_bool;
+
+# dialect: sqlite
+SELECT NOT(NOT(NOT(NOT t_bool.a))) FROM t_bool;
+SELECT NOT NOT NOT NOT t_bool.a FROM t_bool;
+
+# dialect: mysql
+WITH t0 AS (SELECT 1 AS a, 'foo' AS p) SELECT NOT(NOT(CASE WHEN t0.a > 1 THEN t0.a ELSE t0.p END)) AS res FROM t0;
+WITH t0 AS (SELECT 1 AS a, 'foo' AS p) SELECT NOT NOT CASE WHEN t0.a > 1 THEN t0.a ELSE t0.p END AS res FROM t0;
+
+# dialect: sqlite
+WITH t0 AS (SELECT 1 AS a, 'foo' AS p) SELECT NOT (NOT(CASE WHEN t0.a > 1 THEN t0.a ELSE t0.p END)) AS res FROM t0;
+WITH t0 AS (SELECT 1 AS a, 'foo' AS p) SELECT NOT NOT CASE WHEN t0.a > 1 THEN t0.a ELSE t0.p END AS res FROM t0;
+
+--------------------------------------
+-- Simplify complements
+--------------------------------------
+TRUE OR NOT TRUE;
+TRUE;
+
+TRUE AND NOT TRUE;
+FALSE;
+
+'a' OR NOT 'a';
+TRUE;
+
+'a' AND NOT 'a';
+FALSE;
+
+100 OR NOT 100;
+TRUE;
+
+100 AND NOT 100;
+FALSE;
+
+NULL OR NOT NULL;
+NULL AND TRUE;
+
+NULL AND NOT NULL;
+NULL AND TRUE;
+
+NULL OR (NULL AND TRUE);
+NULL AND TRUE;
+
+SELECT IF(NULL = NULL, 1, 100);
+SELECT 100;
+
+# dialect: snowflake
+SELECT * FROM o ASOF JOIN e MATCH_CONDITION (o.observed_date >= e.metric_date) ON o.id = e.id;
+SELECT * FROM o ASOF JOIN e MATCH_CONDITION (o.observed_date >= e.metric_date) ON e.id = o.id;
+

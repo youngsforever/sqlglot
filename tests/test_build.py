@@ -161,6 +161,10 @@ class TestBuild(unittest.TestCase):
                 "SELECT x, y, z, a FROM tbl GROUP BY x, y, z, a",
             ),
             (
+                lambda: select(1).from_("tbl").group_by("x with cube"),
+                "SELECT 1 FROM tbl GROUP BY x WITH CUBE",
+            ),
+            (
                 lambda: select("x").distinct("a", "b").from_("tbl"),
                 "SELECT DISTINCT ON (a, b) x FROM tbl",
             ),
@@ -357,8 +361,32 @@ class TestBuild(unittest.TestCase):
             (
                 lambda: select("x")
                 .from_("tbl")
+                .with_("tbl", as_="SELECT x FROM tbl2", materialized=True),
+                "WITH tbl AS MATERIALIZED (SELECT x FROM tbl2) SELECT x FROM tbl",
+            ),
+            (
+                lambda: select("x")
+                .from_("tbl")
+                .with_("tbl", as_="SELECT x FROM tbl2", materialized=False),
+                "WITH tbl AS NOT MATERIALIZED (SELECT x FROM tbl2) SELECT x FROM tbl",
+            ),
+            (
+                lambda: select("x")
+                .from_("tbl")
                 .with_("tbl", as_="SELECT x FROM tbl2", recursive=True),
                 "WITH RECURSIVE tbl AS (SELECT x FROM tbl2) SELECT x FROM tbl",
+            ),
+            (
+                lambda: select("x")
+                .from_("tbl")
+                .with_("tbl", as_=select("x").from_("tbl2"), recursive=True, materialized=True),
+                "WITH RECURSIVE tbl AS MATERIALIZED (SELECT x FROM tbl2) SELECT x FROM tbl",
+            ),
+            (
+                lambda: select("x")
+                .from_("tbl")
+                .with_("tbl", as_=select("x").from_("tbl2"), recursive=True, materialized=False),
+                "WITH RECURSIVE tbl AS NOT MATERIALIZED (SELECT x FROM tbl2) SELECT x FROM tbl",
             ),
             (
                 lambda: select("x").from_("tbl").with_("tbl", as_=select("x").from_("tbl2")),
@@ -513,7 +541,7 @@ class TestBuild(unittest.TestCase):
             ),
             (
                 lambda: parse_one("WITH t AS (SELECT 1) (SELECT 1)").limit(1),
-                "WITH t AS (SELECT 1) (SELECT 1) LIMIT 1",
+                "WITH t AS (SELECT 1) SELECT 1 LIMIT 1",
             ),
             (
                 lambda: parse_one("(SELECT 1 LIMIT 2)").limit(1),
@@ -548,6 +576,36 @@ class TestBuild(unittest.TestCase):
             (
                 lambda: exp.update("tbl", {"x": 1}, from_="tbl2 cross join tbl3"),
                 "UPDATE tbl SET x = 1 FROM tbl2 CROSS JOIN tbl3",
+            ),
+            (
+                lambda: exp.update(
+                    "my_table",
+                    {"x": 1},
+                    from_="baz",
+                    where="my_table.id = baz.id",
+                    with_={"baz": "SELECT id FROM foo UNION SELECT id FROM bar"},
+                ),
+                "WITH baz AS (SELECT id FROM foo UNION SELECT id FROM bar) UPDATE my_table SET x = 1 FROM baz WHERE my_table.id = baz.id",
+            ),
+            (
+                lambda: exp.update("my_table").set_("x = 1"),
+                "UPDATE my_table SET x = 1",
+            ),
+            (
+                lambda: exp.update("my_table").set_("x = 1").where("y = 2"),
+                "UPDATE my_table SET x = 1 WHERE y = 2",
+            ),
+            (
+                lambda: exp.update("my_table").set_("a = 1").set_("b = 2"),
+                "UPDATE my_table SET a = 1, b = 2",
+            ),
+            (
+                lambda: exp.update("my_table")
+                .set_("x = 1")
+                .where("my_table.id = baz.id")
+                .from_("baz")
+                .with_("baz", "SELECT id FROM foo"),
+                "WITH baz AS (SELECT id FROM foo) UPDATE my_table SET x = 1 FROM baz WHERE my_table.id = baz.id",
             ),
             (
                 lambda: union("SELECT * FROM foo", "SELECT * FROM bla"),
@@ -673,6 +731,18 @@ class TestBuild(unittest.TestCase):
                 "WITH cte AS (SELECT x FROM tbl) INSERT INTO t SELECT * FROM cte",
             ),
             (
+                lambda: exp.insert("SELECT * FROM cte", "t").with_(
+                    "cte", as_="SELECT x FROM tbl", materialized=True
+                ),
+                "WITH cte AS MATERIALIZED (SELECT x FROM tbl) INSERT INTO t SELECT * FROM cte",
+            ),
+            (
+                lambda: exp.insert("SELECT * FROM cte", "t").with_(
+                    "cte", as_="SELECT x FROM tbl", materialized=False
+                ),
+                "WITH cte AS NOT MATERIALIZED (SELECT x FROM tbl) INSERT INTO t SELECT * FROM cte",
+            ),
+            (
                 lambda: exp.convert((exp.column("x"), exp.column("y"))).isin((1, 2), (3, 4)),
                 "(x, y) IN ((1, 2), (3, 4))",
                 "postgres",
@@ -690,6 +760,83 @@ class TestBuild(unittest.TestCase):
             (
                 lambda: exp.rename_column("table1", "c1", "c2"),
                 "ALTER TABLE table1 RENAME COLUMN c1 TO c2",
+            ),
+            (
+                lambda: exp.merge(
+                    "WHEN MATCHED THEN UPDATE SET col1 = source.col1",
+                    "WHEN NOT MATCHED THEN INSERT (col1) VALUES (source.col1)",
+                    into="target_table",
+                    using="source_table",
+                    on="target_table.id = source_table.id",
+                ),
+                "MERGE INTO target_table USING source_table ON target_table.id = source_table.id WHEN MATCHED THEN UPDATE SET col1 = source.col1 WHEN NOT MATCHED THEN INSERT (col1) VALUES (source.col1)",
+            ),
+            (
+                lambda: exp.merge(
+                    "WHEN MATCHED AND source.is_deleted = 1 THEN DELETE",
+                    "WHEN MATCHED THEN UPDATE SET val = source.val",
+                    "WHEN NOT MATCHED THEN INSERT (id, val) VALUES (source.id, source.val)",
+                    into="target_table",
+                    using="source_table",
+                    on="target_table.id = source_table.id",
+                ),
+                "MERGE INTO target_table USING source_table ON target_table.id = source_table.id WHEN MATCHED AND source.is_deleted = 1 THEN DELETE WHEN MATCHED THEN UPDATE SET val = source.val WHEN NOT MATCHED THEN INSERT (id, val) VALUES (source.id, source.val)",
+            ),
+            (
+                lambda: exp.merge(
+                    "WHEN MATCHED THEN UPDATE SET target.name = source.name",
+                    into=exp.table_("target_table").as_("target"),
+                    using=exp.table_("source_table").as_("source"),
+                    on="target.id = source.id",
+                ),
+                "MERGE INTO target_table AS target USING source_table AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET target.name = source.name",
+            ),
+            (
+                lambda: exp.merge(
+                    "WHEN MATCHED THEN UPDATE SET target.name = source.name",
+                    into=exp.table_("target_table").as_("target"),
+                    using=exp.table_("source_table").as_("source"),
+                    on="target.id = source.id",
+                    returning="target.*",
+                ),
+                "MERGE INTO target_table AS target USING source_table AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET target.name = source.name RETURNING target.*",
+            ),
+            (
+                lambda: exp.merge(
+                    exp.When(
+                        matched=True,
+                        then=exp.Update(
+                            expressions=[
+                                exp.column("name", "target").eq(exp.column("name", "source"))
+                            ]
+                        ),
+                    ),
+                    into=exp.table_("target_table").as_("target"),
+                    using=exp.table_("source_table").as_("source"),
+                    on="target.id = source.id",
+                    returning="target.*",
+                ),
+                "MERGE INTO target_table AS target USING source_table AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET target.name = source.name RETURNING target.*",
+            ),
+            (
+                lambda: exp.union("SELECT 1", "SELECT 2", "SELECT 3", "SELECT 4"),
+                "SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4",
+            ),
+            (
+                lambda: select("x")
+                .with_("var1", as_=select("x").from_("tbl2").subquery(), scalar=True)
+                .from_("tbl")
+                .where("x > var1"),
+                "WITH (SELECT x FROM tbl2) AS var1 SELECT x FROM tbl WHERE x > var1",
+                "clickhouse",
+            ),
+            (
+                lambda: select("x")
+                .with_("var1", as_=select("x").from_("tbl2"), scalar=True)
+                .from_("tbl")
+                .where("x > var1"),
+                "WITH (SELECT x FROM tbl2) AS var1 SELECT x FROM tbl WHERE x > var1",
+                "clickhouse",
             ),
         ]:
             with self.subTest(sql):

@@ -7,14 +7,15 @@ import re
 import sys
 import typing as t
 from collections.abc import Collection, Set
-from contextlib import contextmanager
 from copy import copy
+from difflib import get_close_matches
 from enum import Enum
 from itertools import count
 
 if t.TYPE_CHECKING:
     from sqlglot import exp
     from sqlglot._typing import A, E, T
+    from sqlglot.dialects.dialect import DialectType
     from sqlglot.expressions import Expression
 
 
@@ -44,6 +45,20 @@ class classproperty(property):
         return classmethod(self.fget).__get__(None, owner)()  # type: ignore
 
 
+def suggest_closest_match_and_fail(
+    kind: str,
+    word: str,
+    possibilities: t.Iterable[str],
+) -> None:
+    close_matches = get_close_matches(word, possibilities, n=1)
+
+    similar = seq_get(close_matches, 0) or ""
+    if similar:
+        similar = f" Did you mean {similar}?"
+
+    raise ValueError(f"Unknown {kind} '{word}'.{similar}")
+
+
 def seq_get(seq: t.Sequence[T], index: int) -> t.Optional[T]:
     """Returns the value in `seq` at position `index`, or `None` if `index` is out of bounds."""
     try:
@@ -54,6 +69,10 @@ def seq_get(seq: t.Sequence[T], index: int) -> t.Optional[T]:
 
 @t.overload
 def ensure_list(value: t.Collection[T]) -> t.List[T]: ...
+
+
+@t.overload
+def ensure_list(value: None) -> t.List: ...
 
 
 @t.overload
@@ -120,7 +139,7 @@ def csv(*args: str, sep: str = ", ") -> str:
 def subclasses(
     module_name: str,
     classes: t.Type | t.Tuple[t.Type, ...],
-    exclude: t.Type | t.Tuple[t.Type, ...] = (),
+    exclude: t.Set[t.Type] = set(),
 ) -> t.List[t.Type]:
     """
     Returns all subclasses for a collection of classes, possibly excluding some of them.
@@ -128,7 +147,7 @@ def subclasses(
     Args:
         module_name: The name of the module to search for subclasses in.
         classes: Class(es) we want to find the subclasses of.
-        exclude: Class(es) we want to exclude from the returned list.
+        exclude: Classes we want to exclude from the returned list.
 
     Returns:
         The target subclasses.
@@ -146,6 +165,7 @@ def apply_index_offset(
     this: exp.Expression,
     expressions: t.List[E],
     offset: int,
+    dialect: DialectType = None,
 ) -> t.List[E]:
     """
     Applies an offset to a given integer literal expression.
@@ -154,6 +174,7 @@ def apply_index_offset(
         this: The target of the index.
         expressions: The expression the offset will be applied to, wrapped in a list.
         offset: The offset that will be applied.
+        dialect: the dialect of interest.
 
     Returns:
         The original expression with the offset applied to it, wrapped in a list. If the provided
@@ -169,7 +190,7 @@ def apply_index_offset(
     from sqlglot.optimizer.simplify import simplify
 
     if not this.type:
-        annotate_types(this)
+        annotate_types(this, dialect=dialect)
 
     if t.cast(exp.DataType, this.type).this not in (
         exp.DataType.Type.UNKNOWN,
@@ -178,9 +199,10 @@ def apply_index_offset(
         return expressions
 
     if not expression.type:
-        annotate_types(expression)
+        annotate_types(expression, dialect=dialect)
+
     if t.cast(exp.DataType, expression.type).this in exp.DataType.INTEGER_TYPES:
-        logger.warning("Applying array index offset (%s)", offset)
+        logger.info("Applying array index offset (%s)", offset)
         expression = simplify(expression + offset)
         return [expression]
 
@@ -203,16 +225,13 @@ def while_changing(expression: Expression, func: t.Callable[[Expression], E]) ->
     Returns:
         The transformed expression.
     """
+
     while True:
-        for n in reversed(tuple(expression.walk())):
-            n._hash = hash(n)
-
-        start = hash(expression)
+        start_hash = hash(expression)
         expression = func(expression)
+        end_hash = hash(expression)
 
-        for n in expression.walk():
-            n._hash = None
-        if start == hash(expression):
+        if start_hash == end_hash:
             break
 
     return expression
@@ -250,47 +269,6 @@ def tsort(dag: t.Dict[T, t.Set[T]]) -> t.List[T]:
         result.extend(sorted(current))  # type: ignore
 
     return result
-
-
-def open_file(file_name: str) -> t.TextIO:
-    """Open a file that may be compressed as gzip and return it in universal newline mode."""
-    with open(file_name, "rb") as f:
-        gzipped = f.read(2) == b"\x1f\x8b"
-
-    if gzipped:
-        import gzip
-
-        return gzip.open(file_name, "rt", newline="")
-
-    return open(file_name, encoding="utf-8", newline="")
-
-
-@contextmanager
-def csv_reader(read_csv: exp.ReadCSV) -> t.Any:
-    """
-    Returns a csv reader given the expression `READ_CSV(name, ['delimiter', '|', ...])`.
-
-    Args:
-        read_csv: A `ReadCSV` function call.
-
-    Yields:
-        A python csv reader.
-    """
-    args = read_csv.expressions
-    file = open_file(read_csv.name)
-
-    delimiter = ","
-    args = iter(arg.name for arg in args)  # type: ignore
-    for k, v in zip(args, args):
-        if k == "delimiter":
-            delimiter = v
-
-    try:
-        import csv as csv_
-
-        yield csv_.reader(file, delimiter=delimiter)
-    finally:
-        file.close()
 
 
 def find_new_name(taken: t.Collection[str], base: str) -> str:
@@ -449,6 +427,20 @@ def dict_depth(d: t.Dict) -> int:
 def first(it: t.Iterable[T]) -> T:
     """Returns the first element from an iterable (useful for sets)."""
     return next(i for i in it)
+
+
+def to_bool(value: t.Optional[str | bool]) -> t.Optional[str | bool]:
+    if isinstance(value, bool) or value is None:
+        return value
+
+    # Coerce the value to boolean if it matches to the truthy/falsy values below
+    value_lower = value.lower()
+    if value_lower in ("true", "1"):
+        return True
+    if value_lower in ("false", "0"):
+        return False
+
+    return value
 
 
 def merge_ranges(ranges: t.List[t.Tuple[A, A]]) -> t.List[t.Tuple[A, A]]:

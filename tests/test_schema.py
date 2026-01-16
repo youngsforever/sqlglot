@@ -202,11 +202,11 @@ class TestSchema(unittest.TestCase):
             dialect="clickhouse",
         )
 
-        table_z = exp.table_("z", db="y", catalog="x")
+        table_z = exp.table_("Z", db="y", catalog="x")
         table_w = exp.table_("w", db="y", catalog="x")
 
         self.assertEqual(schema.column_names(table_z), ["a", "B"])
-        self.assertEqual(schema.column_names(table_w), ["c"])
+        self.assertEqual(schema.column_names(table_w), ["C"])
 
         schema = MappingSchema(schema={"x": {"`y`": "INT"}}, dialect="clickhouse")
         self.assertEqual(schema.column_names(exp.table_("x")), ["y"])
@@ -241,6 +241,36 @@ class TestSchema(unittest.TestCase):
         schema = MappingSchema(schema={"X": {"y": "int"}}, normalize=False, dialect="snowflake")
         self.assertEqual(schema.column_names("x", normalize=True), ["y"])
 
+        # Check that identifiers in nested data types are normalized
+        # BigQuery: STRUCT field names should be lowercased
+        schema = MappingSchema({"t": {"col": "STRUCT<FooBar INT>"}}, dialect="bigquery")
+        col_type = schema.get_column_type("t", "col")
+        self.assertEqual(col_type.expressions[0].name, "foobar")
+
+        # Snowflake: STRUCT field names should be uppercased
+        schema = MappingSchema({"t": {"col": "STRUCT<FooBar INT>"}}, dialect="snowflake")
+        col_type = schema.get_column_type("T", "COL")
+        self.assertEqual(col_type.expressions[0].name, "FOOBAR")
+
+        # ClickHouse: STRUCT field names should preserve case (case-sensitive)
+        schema = MappingSchema({"t": {"col": "STRUCT<FooBar INT>"}}, dialect="clickhouse")
+        col_type = schema.get_column_type("t", "col")
+        self.assertEqual(col_type.expressions[0].name, "FooBar")
+
+        # Nested STRUCT field names should also be normalized
+        schema = MappingSchema(
+            {"t": {"col": "STRUCT<Outer STRUCT<Inner INT>>"}}, dialect="bigquery"
+        )
+        col_type = schema.get_column_type("t", "col")
+        self.assertEqual(col_type.expressions[0].name, "outer")
+        self.assertEqual(col_type.expressions[0].kind.expressions[0].name, "inner")
+
+        # ARRAY of STRUCT field names should also be normalized
+        schema = MappingSchema({"t": {"col": "ARRAY<STRUCT<FooBar INT>>"}}, dialect="bigquery")
+        col_type = schema.get_column_type("t", "col")
+        struct_type = col_type.expressions[0]
+        self.assertEqual(struct_type.expressions[0].name, "foobar")
+
     def test_same_number_of_qualifiers(self):
         schema = MappingSchema({"x": {"y": {"c1": "int"}}})
 
@@ -271,7 +301,42 @@ class TestSchema(unittest.TestCase):
             "Table z must match the schema's nesting level: 2.",
         )
 
+        with self.assertRaises(SchemaError) as ctx:
+            MappingSchema(
+                {
+                    "catalog": {
+                        "db": {"tbl": {"col": "a"}},
+                    },
+                    "tbl2": {"col": "b"},
+                },
+            )
+        self.assertEqual(
+            str(ctx.exception),
+            "Table tbl2 must match the schema's nesting level: 3.",
+        )
+
+        with self.assertRaises(SchemaError) as ctx:
+            MappingSchema(
+                {
+                    "tbl2": {"col": "b"},
+                    "catalog": {
+                        "db": {"tbl": {"col": "a"}},
+                    },
+                },
+            )
+        self.assertEqual(
+            str(ctx.exception),
+            "Table catalog.db.tbl must match the schema's nesting level: 1.",
+        )
+
     def test_has_column(self):
         schema = MappingSchema({"x": {"c": "int"}})
         self.assertTrue(schema.has_column("x", exp.column("c")))
         self.assertFalse(schema.has_column("x", exp.column("k")))
+
+    def test_find(self):
+        schema = MappingSchema({"x": {"c": "int"}})
+        found = schema.find(exp.to_table("x"))
+        self.assertEqual(found, {"c": "int"})
+        found = schema.find(exp.to_table("x"), ensure_data_types=True)
+        self.assertEqual(found, {"c": exp.DataType.build("int")})
